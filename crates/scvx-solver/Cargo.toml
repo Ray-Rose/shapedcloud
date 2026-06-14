@@ -1,0 +1,14 @@
+[package]
+name         = "scvx-solver"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+scvx-core     = { workspace = true }
+scvx-dynamics = { workspace = true }
+scvx-ipm      = { workspace = true }
+nalgebra      = { workspace = true }
+libm          = { workspace = true }

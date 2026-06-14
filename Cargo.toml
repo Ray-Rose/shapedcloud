@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scvx-core",
+    "crates/scvx-dynamics",
+    "crates/scvx-ipm",
+    "crates/scvx-solver",
+    "crates/scvx-ffi",
+]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.94"
+license      = "Apache-2.0 OR MIT"
+publish      = false
+
+[workspace.dependencies]
+nalgebra    = { version = "0.33", default-features = false, features = ["libm"] }
+libm        = { version = "0.2",  default-features = false }
+num-traits  = { version = "0.2",  default-features = false, features = ["libm"] }
+
+scvx-core     = { path = "crates/scvx-core" }
+scvx-dynamics = { path = "crates/scvx-dynamics" }
+scvx-ipm      = { path = "crates/scvx-ipm" }
+scvx-solver   = { path = "crates/scvx-solver" }
+scvx-ffi      = { path = "crates/scvx-ffi" }
+
+[profile.release]
+panic           = "abort"
+lto             = "fat"
+codegen-units   = 1
+opt-level       = 3
+debug           = false
+overflow-checks = false
+strip           = false
+
+[profile.dev]
+panic           = "abort"
+opt-level       = 1
+overflow-checks = true

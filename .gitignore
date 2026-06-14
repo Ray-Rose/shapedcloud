@@ -1,0 +1,28 @@
+# --- Rust build artifacts (~1.4 GB locally; never committed) ---
+/target
+/build-target
+
+# --- Claude Code local agent state ---
+.claude/
+
+# --- Python oracle virtualenv (machine-specific; keep only solve_canonical.py) ---
+tools/py-oracle/Lib/
+tools/py-oracle/Scripts/
+tools/py-oracle/pyvenv.cfg
+tools/py-oracle/.lock
+tools/py-oracle/CACHEDIR.TAG
+__pycache__/
+*.pyc
+
+# --- Copyrighted reference papers / paper extracts (not redistributed) ---
+*.pdf
+_sdpt3_extract.txt
+_sdpt3_guide_extract.txt
+sdpt3_extract.txt
+socp_extract.txt
+ag-socp.txt
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp

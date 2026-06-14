@@ -1,0 +1,36 @@
+[package]
+name         = "scvx-ffi"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+
+[lib]
+name       = "scvx_ffi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# `std` (default): host build — uses std's default panic handler, and `#[test]`
+# works out of the box. This is what CI, examples, and host integration use.
+#
+# Disable it (`--no-default-features`) for a pure `#![no_std]` build that can
+# cross-compile to a bare-metal flight target (e.g. thumbv7em-none-eabihf):
+#   * The whole algorithm stack (scvx-core/dynamics/ipm/solver) is already
+#     no_std, so only this boundary crate needs the switch.
+#   * Link the resulting `rlib` into a flight binary that supplies its own
+#     `#[panic_handler]` (the usual flight pattern — signal the watchdog / jump
+#     to a fault vector), OR
+#   * enable `panic-handler` to get a minimal built-in handler so the
+#     `staticlib`/`cdylib` artifacts link standalone for the target.
+default = ["std"]
+std = []
+# Provide a minimal `#[panic_handler]` (busy-loop) for standalone no_std
+# staticlib/cdylib builds. Off by default; ignored when `std` is enabled.
+panic-handler = []
+
+[dependencies]
+scvx-core   = { workspace = true }
+scvx-solver = { workspace = true }
+nalgebra    = { workspace = true }
+libm        = { workspace = true }
