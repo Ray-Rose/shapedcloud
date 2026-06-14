@@ -999,6 +999,39 @@ blocked making the lenient thresholds the global default.
 
 ---
 
+## Phase 15 — NT flight-scale root cause PINPOINTED (forward item #2)
+
+A non-invasive per-cone analysis (`structured_socp::tests::diag_nt_endgame_per_cone`,
+`#[ignore]`d) swept `solve_socp_nt` over increasing `max_iters` on a flight-scale
+subproblem and read the per-cone complementarity + interiority margins from the
+live iterate. **The breakdown is driven specifically by the virtual-control
+(ν) SOC⁸ cones**, and the finding is *structural*, not a tuning gap:
+
+- The SCvx penalty drives the dynamics defect ν→0 by design, so the
+  virtual-control SOC⁸ slacks ride onto their cone boundary (measured
+  interiority margin collapses to ~3e-11 — a cone sitting *on* its boundary).
+- That makes the per-cone complementarity spread enormous (~10¹¹: thrust/trust
+  cones ≈3.5e7 vs virtual-control ≈1e-4). NT's geometric-mean scaling `W` blows
+  up for the near-boundary cone, and that one ill-conditioned block **poisons
+  the global Newton step** — μ stalls at ~1.5e6 and never decreases (raw NT,
+  status IterCap), or `W`→non-finite under preconditioning (status
+  NumericalError, the production symptom).
+- **AHO's arrow scaling is robust to vanishing cones** — which is precisely why
+  AHO converges on the identical problem and is the production default.
+
+**Conclusion (honest):** this refines the earlier "linearization degeneracy"
+note into a concrete structural mismatch — **NT's scaling cannot handle cones
+that vanish at the optimum**, which the SCvx virtual-control relaxation always
+produces. A real NT fix would need SDPT3-level per-cone handling of vanishing
+cones (per-cone scaling regularization / a wide-neighborhood scheme that keeps
+the relaxation cones off their boundary), a substantial IPM-research effort. The
+corrector + IR attempts (Phases 9/13) and now this analysis exhaust the
+cheap/tuning avenues. **Recommendation: keep AHO as the validated production
+direction; NT stays opt-in with graceful AHO fallback.** No production code
+changed this phase — the deliverable is the diagnosis + the reproducible probe.
+
+---
+
 ## Final state summary
 
 ```

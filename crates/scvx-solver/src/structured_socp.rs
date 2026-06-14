@@ -1978,4 +1978,88 @@ mod tests {
         assert!(max_diff_y < tol, "NT free-tf Δy mismatch {max_diff_y}");
         assert!(dtau_diff < tol, "NT free-tf δτ mismatch {dtau_diff}");
     }
+
+    /// **DIAGNOSTIC (item #2): pinpoint the NT endgame degeneracy.** Sweeps
+    /// `solve_socp_nt` over increasing `max_iters` on a flight-scale subproblem
+    /// and reports, from the live iterate, the per-cone complementarity
+    /// (sᵢ·yᵢ) spread and the smallest interiority margin — to reveal WHICH
+    /// cone drives the breakdown (the boundary-W-blowup hypothesis: a cone
+    /// nearing its boundary makes the NT scaling Wᵢ blow up as μ→0).
+    /// Run: `cargo test -p scvx-solver diag_nt_endgame_per_cone -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run explicitly with --ignored --nocapture"]
+    fn diag_nt_endgame_per_cone() {
+        // Dense NT StepFactors (NCT×NCT) live on the stack; N=5 needs headroom.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(diag_nt_endgame_per_cone_body)
+            .expect("spawn")
+            .join()
+            .expect("diag thread panicked");
+    }
+
+    fn diag_nt_endgame_per_cone_body() {
+        const N: usize = 5;
+        const NP: usize = N * N_VARS_PER_NODE_SCVX;
+        const NE: usize = N * NX + 6;
+        const NCT: usize = N * N_CONE_DIM_PER_NODE_SCVX;
+        const NCONES: usize = N * 8;
+
+        let phys = mars_params();
+        let mut x_init = SVector::<f64, 7>::zeros();
+        x_init[2] = 100.0;
+        x_init[5] = -10.0;
+        x_init[6] = libm::log(800.0);
+        let traj = hover_reference::<N>(x_init, 800.0, 25.0);
+        let mut lin = std::boxed::Box::new(LinearizedDynamics::<N>::default());
+        discretize_foh(&traj, &phys, &mut lin, 4);
+        let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+        let mut prob = std::boxed::Box::new(SocpProblem::<NP, NE, NCT, NCONES>::default());
+        assemble_scvx_socp::<N, NP, NE, NCT, NCONES>(
+            &traj, &lin, &phys, &x_init, &term, 1.0e3, 1.0e4, false, &mut prob,
+        );
+
+        eprintln!("\n=== NT endgame per-cone sweep (N={N}, 100 m flight scale, raw) ===");
+        eprintln!("    cone dims/node: [4,1,1,3,1,1,11,8]; idx%8: 0=thrust(SOC4) 3=glide(SOC3) 6=trust(SOC11) 7=virt(SOC8)");
+        for k in [3u32, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36] {
+            let params = IpmAlgoParams {
+                max_iters: k,
+                tol_mu: 1.0e-9,
+                tol_primal: 1.0e-7,
+                tol_dual: 1.0e-7,
+                use_nt_scaling: true,
+                ..IpmAlgoParams::default()
+            };
+            let mut ws = std::boxed::Box::new(SocpWorkspace::<NP, NE, NCT>::default());
+            let res = solve_socp_nt(&prob, &params, &mut ws);
+
+            let sd = ws.s.as_slice();
+            let yd = ws.y.as_slice();
+            let mu = ws.s.dot(&ws.y) / (NCT as f64);
+            let mut min_compl = f64::INFINITY;
+            let mut max_compl = 0.0_f64;
+            let mut argmin = 0usize;
+            let mut min_smarg = f64::INFINITY;
+            let mut min_smarg_cone = 0usize;
+            for (ci, cone) in prob.cones.iter().enumerate() {
+                let o = cone.offset;
+                let d = cone.dim;
+                let mut compl = 0.0;
+                let mut bar = 0.0;
+                for i in 0..d { compl += sd[o + i] * yd[o + i]; }
+                for i in 1..d { bar += sd[o + i] * sd[o + i]; }
+                let smarg = sd[o] - libm::sqrt(bar);
+                if compl.is_finite() && compl < min_compl { min_compl = compl; argmin = ci; }
+                if compl.is_finite() && compl > max_compl { max_compl = compl; }
+                if smarg.is_finite() && smarg < min_smarg { min_smarg = smarg; min_smarg_cone = ci; }
+            }
+            let spread = if min_compl > 0.0 { max_compl / min_compl } else { f64::INFINITY };
+            eprintln!(
+                "  k={k:>2} st={} it={:>2} | mu={:>9.2e} | min_compl={:>9.2e}@c{}(t{}) max={:>9.2e} spread={:>7.1e} | min_s_marg={:>9.2e}@c{}(t{})",
+                res.status.as_u32(), res.iters, mu,
+                min_compl, argmin, argmin % 8, max_compl, spread,
+                min_smarg, min_smarg_cone, min_smarg_cone % 8,
+            );
+        }
+    }
 }
