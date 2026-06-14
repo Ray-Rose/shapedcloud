@@ -1231,6 +1231,29 @@ mod tests {
             // Outer loop must not BadInput.
             assert!(!matches!(status, SolverStatus::BadInput));
 
+            // **Convergence-quality guard (honest).** This fixed-tf / τ=10 case
+            // reaches an OuterIterCap floor of ‖ν‖ ≈ 6e-2 under the conservative
+            // DEFAULT trust thresholds — it is NOT tight convergence. (The
+            // adaptive-trust gate keeps its thresholds conservative because its
+            // ρ stays above `rho_shrink`; the un-gated adaptive reached ~1e-9 here
+            // but destabilized other small-N configs, so the gate is the safe
+            // compromise — see HANDOFF "Phase 16".) TIGHT convergence is verified
+            // in `scvx_converges_larger_n_adaptive_trust` (<1e-6) and the free-tf
+            // structured test (<1e-3). This guard just catches a regression that
+            // would blow the defect back up past the ~0.2 stuck floor.
+            let mut min_virt = f64::INFINITY;
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+            }
+            eprintln!("  min ‖ν‖ over accepted iters: {min_virt:.3e}");
+            assert!(
+                min_virt < 1.0e-1,
+                "small-scale defect regressed past its ~6e-2 floor: min ‖ν‖ = {min_virt:.3e}"
+            );
+
             // Reference must be finite.
             for k in 0..N {
                 for i in 0..7 {
@@ -1741,6 +1764,22 @@ mod tests {
                 matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
                 "free-tf structured SCvx hit {} (expected Converged or OuterIterCap)",
                 status as u32
+            );
+
+            // **Convergence quality** (CI guard): the free-tf defect must close
+            // — not merely run cleanly. Conservative bound (≪ the ~0.2 stuck
+            // floor) that's robust to the structured path's fallback/fp drift.
+            let mut min_virt = f64::INFINITY;
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+            }
+            eprintln!("  free-tf min ‖ν‖ over accepted: {min_virt:.3e}");
+            assert!(
+                min_virt < 1.0e-3,
+                "free-tf structured defect did not close: min ‖ν‖ = {min_virt:.3e} (want < 1e-3)"
             );
 
             for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {

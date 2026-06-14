@@ -1032,6 +1032,42 @@ changed this phase — the deliverable is the diagnosis + the reproducible probe
 
 ---
 
+## Phase 16 — coverage hardening (forward item #3, LANDED)
+
+Strengthened the test suite to *assert* what was previously only smoke-tested or
+printed in traces. All additions are CI-runnable with no external solver at test
+time (the external oracle values are baked-in from offline CVXPY/Julia runs).
+
+- **NT validated against the external oracle** (`oracle_diff.rs`): the 3 baked-in
+  CVXPY/Julia toy SOCPs now check **both** AHO and NT — NT matches to ≤1.2e-4
+  (well under the 1e-3 tol), confirming NT is *correct* on well-conditioned
+  problems (it only fails on the flight subproblem's vanishing cones, Phase 15).
+- **Self-consistent KKT-optimality oracle** (`assert_kkt_optimal`): every solve
+  (AHO + NT) is verified to satisfy the SOCP KKT conditions — primal feasibility
+  `A·x=b`/`G·x+s=h`, dual stationarity `c+Aᵀλ+Gᵀy=0`, complementarity `s·y≈0`,
+  and cone membership — to ~1e-5–1e-13. This proves the solver returns a TRUE
+  optimum, not just an `Optimal` *label*; no external reference needed.
+- **Convergence-quality ‖ν‖ assertions** promoted from `eprintln` traces to CI:
+  tight where convergence is real (`scvx_converges_larger_n_adaptive_trust` <1e-6;
+  free-tf structured <1e-3), and an honest floor-guard where it is not.
+
+- **Finding surfaced by the hardening (honest):** the fixed-tf 2 m / τ=10 case
+  (`scvx_converges_on_small_problem`) reaches only ‖ν‖≈6e-2 under the DEFAULT
+  conservative thresholds — NOT tight convergence. Its ρ stays above `rho_shrink`
+  so the adaptive-trust **gate keeps it conservative**; the un-gated adaptive
+  reached ~1e-9 here but destabilized other small-N configs (the Phase-14
+  regression), so the gate is the safe compromise. The status-only assertion had
+  masked this. The test now carries an honest floor-guard (<1e-1) + a comment;
+  tight convergence is demonstrated by the larger-N / free-tf tests.
+  **Item-#1 follow-up**: a smarter gate (or per-cone-balanced centering) could
+  recover tight convergence for this case without the over-grow that breaks the
+  api fixed-tf config — a real but bounded future improvement.
+
+All changes are TEST-ONLY (no production code touched). 124 tests; clippy clean;
+thumb (solver+FFI); example deterministic.
+
+---
+
 ## Final state summary
 
 ```

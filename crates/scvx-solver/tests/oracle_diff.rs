@@ -12,7 +12,50 @@
 
 use nalgebra::{SMatrix, SVector};
 use scvx_core::{IpmAlgoParams, IpmStatus};
-use scvx_ipm::{solve_socp, ConeDesc, SocpProblem, SocpWorkspace};
+use scvx_ipm::{solve_socp, solve_socp_nt, ConeDesc, SocpProblem, SocpResult, SocpWorkspace};
+
+/// **Self-consistent optimality oracle** (no external reference needed):
+/// verify the returned (x, λ, s, y) actually satisfy the SOCP KKT conditions —
+/// primal feasibility `A·x=b`, `G·x+s=h`; dual feasibility `c+Aᵀλ+Gᵀy=0`;
+/// complementarity `s·y≈0`; and `s, y ∈ K` (each cone interior). This validates
+/// that the solver found a TRUE optimum, not just that it returned `Optimal`.
+fn assert_kkt_optimal<
+    const NP: usize, const NE: usize, const NCT: usize, const NCONES: usize,
+>(
+    label: &str,
+    prob: &SocpProblem<NP, NE, NCT, NCONES>,
+    res:  &SocpResult<NP, NE, NCT>,
+    tol:  f64,
+) {
+    let r_a = (prob.a_mat * res.x - prob.b).norm();
+    let r_g = (prob.g_mat * res.x + res.s - prob.h).norm();
+    let r_d = (prob.c
+        + prob.a_mat.transpose() * res.lambda
+        + prob.g_mat.transpose() * res.y).norm();
+    let compl = (res.s.dot(&res.y)).abs() / (NCT as f64);
+
+    let s = res.s.as_slice();
+    let y = res.y.as_slice();
+    let mut min_s_marg = f64::INFINITY;
+    let mut min_y_marg = f64::INFINITY;
+    for cone in prob.cones.iter() {
+        let (o, d) = (cone.offset, cone.dim);
+        let sb = (1..d).map(|i| s[o + i] * s[o + i]).sum::<f64>().sqrt();
+        let yb = (1..d).map(|i| y[o + i] * y[o + i]).sum::<f64>().sqrt();
+        min_s_marg = min_s_marg.min(s[o] - sb);
+        min_y_marg = min_y_marg.min(y[o] - yb);
+    }
+    eprintln!(
+        "  KKT[{label}]: |Ax-b|={r_a:.2e} |Gx+s-h|={r_g:.2e} |c+Aᵀλ+Gᵀy|={r_d:.2e} \
+         s·y/n={compl:.2e} s_marg={min_s_marg:.2e} y_marg={min_y_marg:.2e}"
+    );
+    assert!(r_a < tol, "{label}: primal-eq residual {r_a:.2e} >= {tol:.1e}");
+    assert!(r_g < tol, "{label}: primal-cone residual {r_g:.2e} >= {tol:.1e}");
+    assert!(r_d < tol, "{label}: dual-stationarity residual {r_d:.2e} >= {tol:.1e}");
+    assert!(compl < tol, "{label}: complementarity {compl:.2e} >= {tol:.1e}");
+    assert!(min_s_marg > -tol, "{label}: s left the cone (margin {min_s_marg:.2e})");
+    assert!(min_y_marg > -tol, "{label}: y left the cone (margin {min_y_marg:.2e})");
+}
 
 /// Per-problem reference solution from CVXPY/Clarabel and Julia/Clarabel,
 /// captured to 12 significant digits from oracle runs.
@@ -72,6 +115,14 @@ fn rust_ipm_matches_oracles_toy_1cone() {
     let result = solve_socp(&prob, &params, &mut ws);
 
     diff_against_oracle("toy", &REF_TOY, result.status, result.x.as_slice());
+    assert_kkt_optimal("toy/AHO", &prob, &result, 1.0e-3);
+
+    // NT direction must reach the same external-oracle optimum on this toy
+    // (NT is well-conditioned here — no vanishing cones).
+    let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
+    diff_against_oracle("toy/NT", &REF_TOY, res_nt.status, res_nt.x.as_slice());
+    assert_kkt_optimal("toy/NT", &prob, &res_nt, 1.0e-3);
 }
 
 #[test]
@@ -105,6 +156,12 @@ fn rust_ipm_matches_oracles_two_cone() {
     let result = solve_socp(&prob, &params, &mut ws);
 
     diff_against_oracle("two_cone", &REF_TWO_CONE, result.status, result.x.as_slice());
+    assert_kkt_optimal("two_cone/AHO", &prob, &result, 1.0e-3);
+
+    let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
+    diff_against_oracle("two_cone/NT", &REF_TWO_CONE, res_nt.status, res_nt.x.as_slice());
+    assert_kkt_optimal("two_cone/NT", &prob, &res_nt, 1.0e-3);
 }
 
 #[test]
@@ -129,6 +186,12 @@ fn rust_ipm_matches_oracles_socp_4d() {
     let result = solve_socp(&prob, &params, &mut ws);
 
     diff_against_oracle("socp_4d", &REF_SOCP_4D, result.status, result.x.as_slice());
+    assert_kkt_optimal("socp_4d/AHO", &prob, &result, 1.0e-3);
+
+    let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
+    diff_against_oracle("socp_4d/NT", &REF_SOCP_4D, res_nt.status, res_nt.x.as_slice());
+    assert_kkt_optimal("socp_4d/NT", &prob, &res_nt, 1.0e-3);
 }
 
 // ===========================================================================
