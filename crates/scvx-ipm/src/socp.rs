@@ -852,6 +852,18 @@ fn solve_newton_step_nt<
 
 const BACKOFF: f64 = 0.99;
 
+/// Hard upper bound on inner-IPM iterations, independent of the caller-supplied
+/// [`IpmAlgoParams::max_iters`]. Every IPM loop runs `min(max_iters,
+/// IPM_HARD_MAX_ITERS)` times, so the per-solve worst-case iteration count — and
+/// therefore the WCET — is a compile-time constant regardless of what a Rust or
+/// FFI caller passes (a caller cannot blow the flight time budget by requesting
+/// a huge `max_iters`). Sized comfortably above every shipping configuration
+/// (default 25; the SCvx outer loop and tests pass ≤ 50). Raise it — and
+/// re-measure the WCET budget — only if a mission genuinely needs deeper inner
+/// solves. The same cap is applied by the structured drivers in
+/// `scvx_solver::structured_socp`.
+pub const IPM_HARD_MAX_ITERS: u32 = 64;
+
 /// Validate that the (`pub`, caller-constructed) cone descriptors fit within
 /// `NCT`: every cone needs `dim ≥ 1` and `offset + dim ≤ NCT`, with no
 /// `usize` overflow. A malformed descriptor (e.g. from a hand-built or
@@ -932,7 +944,7 @@ pub fn solve_socp<
     let mut prev_x = ws.x;
     let mut prev_y = ws.y;
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         // ---- Residuals at current iterate ----
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
@@ -1095,10 +1107,10 @@ pub fn solve_socp<
             x: ws.best_x, lambda: ws.best_lambda,
             s: ws.best_s, y: ws.best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 
@@ -1162,7 +1174,7 @@ pub fn solve_socp_nt<
     // Hoisted out of the iteration loop (matches the AHO `solve_socp`).
     let e_vec = per_cone_e::<NCT, NCONES>(&prob.cones);
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         // ---- Residuals at current iterate (in ORIGINAL coords) ----
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
@@ -1382,10 +1394,10 @@ pub fn solve_socp_nt<
             x: ws.best_x, lambda: ws.best_lambda,
             s: ws.best_s, y: ws.best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 

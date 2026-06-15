@@ -281,9 +281,12 @@ Row-major, node-indexed (`k = 0 .. N-1`). Layout mirrors the Rust side exactly:
   output bits on the flight target as on the host. The Mars-descent example is
   bit-identical between Linux x86-64 and Windows MSVC.
 - **Bounded WCET.** There are no data-dependent unbounded loops. The outer loop
-  is capped (`FFI_MAX_OUTER = 20`); each inner IPM is capped (`max_inner_iters`);
-  the matrix-sqrt and substitution loops are compile-time bounded. Worst-case
-  cost scales with `N` and the iteration caps, all known at build time.
+  is capped (`FFI_MAX_OUTER = 20`); each inner IPM is capped at a **compile-time**
+  ceiling `IPM_HARD_MAX_ITERS = 64` — the loop runs `min(max_inner_iters, 64)`,
+  so a caller **cannot** enlarge the inner-iteration budget past the compiled
+  bound (raise the constant and rebuild if a mission needs deeper solves); the
+  matrix-sqrt and substitution loops are compile-time bounded. Worst-case cost
+  scales with `N` and these caps, all known at build time.
 - **No heap, no panics on the solve path.** Workspace is caller-provided; all
   error conditions return a status code.
 

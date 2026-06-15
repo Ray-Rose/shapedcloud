@@ -1792,6 +1792,76 @@ mod tests {
         });
     }
 
+    /// **WCET ceiling** — every inner IPM solve honors the compile-time
+    /// `IPM_HARD_MAX_ITERS` cap regardless of the caller's `max_iters`. The
+    /// active-drag subproblems run their inner solver to the iteration cap (they
+    /// don't strictly converge within it), so passing `max_iters = 200` (≫ the
+    /// cap) exercises the clamp: every recorded inner-iter count must stay
+    /// ≤ `IPM_HARD_MAX_ITERS`. WITHOUT the clamp those non-converging solves
+    /// would report up to 200 — so this test fails if the cap is ever removed.
+    #[test]
+    fn ipm_iters_respect_hard_cap() {
+        run_in_big_stack(|| {
+            const N: usize         = 5;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 8;
+
+            let phys = PhysicalParams { rho: 0.02, cd_a: 50.0, ..mars_params() };
+
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 100.0;
+            x_init[5] = -10.0;
+            x_init[6] = (800.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (700.0_f64).ln();
+
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> =
+                Box::default();
+            ws.reference = linear_reference::<N>(x_init, x_target, 750.0, 25.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    50.0,
+                trust_eta_max: 200.0,
+                trust_eta_min: 1.0e-3,
+                ..ScvxAlgoParams::default()
+            };
+            // Absurdly high inner cap: without the IPM_HARD_MAX_ITERS clamp the
+            // non-converging drag subproblems would run all 200 inner iters.
+            let ipm = IpmAlgoParams {
+                max_iters:           200,
+                tol_mu:              1.0e-3,
+                tol_primal:          1.0e-3,
+                tol_dual:            1.0e-3,
+                tol_gap:             1.0e-3,
+                use_preconditioning: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let _ = solve_scvx(&mut ws, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = (ws.iter as usize).min(ws.history.len().saturating_sub(1));
+            let mut max_seen = 0u32;
+            for i in 0..=last {
+                let it = ws.history[i].ipm_iters;
+                assert!(
+                    it <= scvx_ipm::IPM_HARD_MAX_ITERS,
+                    "inner solve at outer {i} ran {it} iters, exceeding the WCET \
+                     cap {} — the IPM_HARD_MAX_ITERS clamp is missing",
+                    scvx_ipm::IPM_HARD_MAX_ITERS,
+                );
+                if it > max_seen {
+                    max_seen = it;
+                }
+            }
+            eprintln!("hard-cap test: max inner iters = {max_seen} (cap {})",
+                      scvx_ipm::IPM_HARD_MAX_ITERS);
+        });
+    }
+
     /// Run one SCvx solve and summarize it as
     /// `(status, outer_iters, min‖ν‖_over_history, last_ipm_status)`.
     /// Test-only diagnostic helper for the envelope sweep below.

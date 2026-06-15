@@ -57,6 +57,7 @@ use scvx_core::{IpmAlgoParams, IpmStatus};
 use scvx_ipm::{
     soc_arrow_matrix, soc_in_interior, soc_jordan_product, soc_max_step,
     soc_nt_w_and_inverse, ConeDesc, SocpProblem, SocpResult, SocpWorkspace,
+    IPM_HARD_MAX_ITERS,
 };
 
 use crate::assemble::{NX, N_VARS_PER_NODE_SCVX};
@@ -500,7 +501,7 @@ pub fn solve_socp_structured<
     // reduction relative to the previous "two full solves" path.
     let mut factor_buf: ReducedKktFactor<N> = ReducedKktFactor::default();
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         // ---- Residuals ----
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
@@ -689,10 +690,10 @@ pub fn solve_socp_structured<
         SocpResult {
             x: best_x, lambda: best_lambda, s: best_s, y: best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 
@@ -806,7 +807,7 @@ pub fn solve_socp_structured_free_tf<
     let mut sol_buf: ReducedKktSolutionFreeTf<N> = ReducedKktSolutionFreeTf::default();
     let mut factor_buf: ReducedKktFactorFreeTf<N> = ReducedKktFactorFreeTf::default();
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
                 + prob.g_mat.transpose() * ws.y;
@@ -971,10 +972,10 @@ pub fn solve_socp_structured_free_tf<
         SocpResult {
             x: best_x, lambda: best_lambda, s: best_s, y: best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 
@@ -1080,7 +1081,7 @@ pub fn solve_socp_structured_nt<
     let mut sol_buf: ReducedKktSolution<N> = ReducedKktSolution::default();
     let mut factor_buf: ReducedKktFactor<N> = ReducedKktFactor::default();
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
                 + prob.g_mat.transpose() * ws.y;
@@ -1299,10 +1300,10 @@ pub fn solve_socp_structured_nt<
         SocpResult {
             x: best_x, lambda: best_lambda, s: best_s, y: best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 
@@ -1410,7 +1411,7 @@ pub fn solve_socp_structured_nt_free_tf<
     let mut sol_buf: ReducedKktSolutionFreeTf<N> = ReducedKktSolutionFreeTf::default();
     let mut factor_buf: ReducedKktFactorFreeTf<N> = ReducedKktFactorFreeTf::default();
 
-    for iter in 0..params.max_iters {
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
         let r_x = prob.c
                 + prob.a_mat.transpose() * ws.lambda
                 + prob.g_mat.transpose() * ws.y;
@@ -1622,10 +1623,10 @@ pub fn solve_socp_structured_nt_free_tf<
         SocpResult {
             x: best_x, lambda: best_lambda, s: best_s, y: best_y,
             status: IpmStatus::BestFeasible,
-            iters:  params.max_iters,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
         }
     } else {
-        numerical_exit(ws, IpmStatus::IterCap, params.max_iters)
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
     }
 }
 

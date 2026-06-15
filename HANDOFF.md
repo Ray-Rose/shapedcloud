@@ -561,7 +561,7 @@ For someone picking up cold, read in this order (rough times noted):
 | No `unsafe` anywhere                                | `#![forbid(unsafe_code)]` on 3/4, scvx-ipm has zero unsafe in source |
 | No NaN propagation from IPM to caller               | `numerical_exit` scrubs NaN to 0.0      |
 | No clamp-panic on bad params                        | Entry validation in `solve_scvx` (6-attack regression test) |
-| Bounded WCET (per IPM iter)                         | IPM loop bounded by caller `max_iters` (default 25; SCvx/FFI callers pass ≤ 50) |
+| Bounded WCET (per IPM iter)                         | Compile-time `IPM_HARD_MAX_ITERS = 64` cap; loop runs `min(max_iters, 64)` |
 | Bounded outer loop iterations                       | `min(algo.max_outer_iters, MAX_OUTER)`  |
 | τ preserved across SCvx iterations                  | Explicit `preserved_tau` capture; regression test |
 | Iterate magnitude bounded                           | `>1e50` check in IPM → `numerical_exit` |
@@ -1196,17 +1196,45 @@ unchanged.
   the IPM loop is in fact bounded by the caller-supplied `max_iters` (default 25;
   SCvx/FFI callers pass ≤ 50).
 
-**Noted follow-ups** (not done here): a compile-time IPM `max_iters` hard cap
-(makes the WCET bound caller-independent — a small production change + full
-gate); external-oracle coverage for the SCvx outer loop / free-tf / NT (today
-only the dense-AHO toy SOCP has a baked CVXPY/Julia oracle).
+**Noted follow-ups**: the compile-time IPM `max_iters` hard cap is now **done
+(Phase 19, below)**; external-oracle coverage for the SCvx outer loop / free-tf /
+NT remains open (today only the dense-AHO toy SOCP has a baked CVXPY/Julia
+oracle).
+
+---
+
+## Phase 19 — WCET hard cap (LANDED)
+
+Makes the bounded-WCET guarantee **caller-independent**. Previously each inner-IPM
+loop ran `params.max_iters` times — a caller-supplied value — so the safety
+table's "hard 25 cap" was an over-claim (Phase 18 corrected it to the honest
+"caller-bounded"). Now a compile-time `IPM_HARD_MAX_ITERS = 64`
+(`scvx_ipm::socp`, re-exported crate-root) bounds **every** IPM loop — the dense
+`solve_socp` / `solve_socp_nt` and all four structured drivers — via
+`for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS)`, and the iter-cap
+return sites report the clamped count too (honest telemetry). No Rust or C caller
+can push the worst-case inner-iteration count past the compiled bound; the WCET
+is a build-time constant.
+
+- **Cap = 64**: comfortably above every shipping config (default 25; SCvx outer
+  loop + tests pass ≤ 50), so `min(max_iters, 64)` is a no-op for all current
+  callers — **zero behavior change** (the 126 prior tests are byte-for-byte
+  unaffected). The toy regression bench (`mehrotra.rs`) is intentionally NOT
+  capped — it is a closed-form verification fixture, not a flight path.
+- **Test**: `scvx::tests::ipm_iters_respect_hard_cap` runs the active-drag
+  problem with `max_iters = 200` (≫ cap); those subproblems run their inner
+  solver to the cap, so every recorded `ipm_iters` must stay ≤ 64 — the test
+  fails (would report up to 200) if the clamp is ever removed. **127 tests pass.**
+- **Docs**: the HANDOFF safety table and `INTEGRATION.md` §9 now state the real
+  compile-time cap (replacing the Phase-18 honest-but-weak "caller-bounded"
+  wording).
 
 ---
 
 ## Final state summary
 
 ```
-Tests:      126 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
+Tests:      127 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
               (Phase 10 v1 added: +1 FFI flag/entrypoint-mismatch regression
                                 + 1 FFI Isp/g0=0 rejection
                                 + 1 FFI N=8/N=10 expanded-surface smoke test;
@@ -1215,7 +1243,8 @@ Tests:      126 passing across 5 crates + 2 integration suites + 3 API + 8 FFI t
                Phase 17 added:   + 1 lunar-gravity convergence (active-drag test
                                    upgraded in place to a convergence gate),
                                  + 1 larger-N drag convergence gate (N=8),
-                                 + 1 #[ignore]d envelope-widening sweep)
+                                 + 1 #[ignore]d envelope-widening sweep;
+               Phase 19 added:   + 1 WCET hard-cap regression test)
               (+22 vs phase-5 end: 5 block_tridiag + 7 reduced_kkt
                                  + 1 active-drag flight-envelope coverage
                                  + 1 solve_socp_structured live-driver equivalence
