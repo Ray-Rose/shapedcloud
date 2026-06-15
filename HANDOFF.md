@@ -1127,20 +1127,47 @@ excluded (TL;DR open item #3) — without touching the validated Mars no-drag pa
 - **Tests.** `scvx_active_drag_path_exercised_and_handled` **upgraded** from
   graceful-handling to a convergence gate (status ∈ {Converged, OuterIterCap},
   min ‖ν‖ < 1e-6, `InnerFailure` no longer acceptable). New
-  `scvx_converges_lunar_gravity` (lunar + cone-row, min ‖ν‖ < 1e-6). New
-  `#[ignore]`d `diag_envelope_widening` characterization sweep. The retry
-  triggers ONLY on inner failure, which the Mars-regime tests never hit, so all
-  prior tests are byte-for-byte unaffected.
-- **Verification:** 125 tests pass (was 124; +1 lunar convergence, drag upgraded
-  in place, +1 ignored diagnostic), clippy `-D warnings` clean, thumb (solver)
-  cross-compile clean. Mars no-drag path unchanged.
+  `scvx_converges_lunar_gravity` (lunar with gravity-appropriate `t_min`, base
+  config, min ‖ν‖ < 1e-6) and `scvx_drag_converges_at_larger_n` (N=8 drag, base
+  config — the generalization gate). New `#[ignore]`d `diag_envelope_widening`
+  sweep (N ∈ {5,8,10} × config matrix). The retry triggers ONLY on inner
+  failure, which the Mars-regime tests never hit, so all prior tests are
+  byte-for-byte unaffected.
+- **Verification:** 126 tests pass (was 124; +1 lunar convergence, +1 larger-N
+  drag gate, drag upgraded in place, +1 ignored diagnostic), clippy `-D warnings`
+  clean, thumb (solver) cross-compile clean. Mars no-drag path unchanged.
+
+### Larger-N generalization + lunar `t_min` root cause (follow-up)
+
+A post-commit sweep (`diag_envelope_widening`, now parameterized over
+N ∈ {5,8,10} with a config matrix) confirms the retry's envelope win is NOT an
+N=5 artifact and pins down the lunar marginality:
+
+- **Active drag converges on the production base config (column preconditioning
+  only) across N = 5 / 8 / 10** — min ‖ν‖ = 1.6e-10 / 1.1e-9 / 2.0e-10. Locked in
+  as a permanent CI gate (`scvx_drag_converges_at_larger_n`, N=8).
+- **Lunar's earlier marginality was a physical-params mismatch, not a solver
+  limit.** With Mars's `t_min = 1000 N`, a lunar descent (hover ≈ 324 N at
+  m_dry) drives the `σ − T_min` thrust-floor cone hard-active — a vanishing-cone
+  stressor — so base converges only at N ≥ 8 and cone-row only at N = 5 (no
+  single config spans all N). Scaling the floor to the weaker gravity
+  (`t_min = 300 N`, ~5% of `t_max`) removes the stressor: **lunar then converges
+  on the base config across N = 5 / 8 / 10** — min ‖ν‖ = 8.2e-11 / 1.0e-10 /
+  7.8e-9 (N=5 even reaches inner-IPM `Optimal`). `scvx_converges_lunar_gravity`
+  updated to this clean config (was cone-row at N=5).
+- **Net envelope statement**: with gravity-appropriate thrust limits, BOTH drag
+  and lunar converge to machine-precision dynamics feasibility on the production
+  DEFAULT config (no cone-row, no adaptive-reg) across the flight-relevant node
+  range. Cone-row scaling helps lunar ONLY in the mis-specified-`t_min` regime
+  and hurts elsewhere; adaptive-reg stays ruled out (over-regularizes the
+  vanishing-cone boundary, breaks iter 0).
 
 ---
 
 ## Final state summary
 
 ```
-Tests:      125 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
+Tests:      126 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
               (Phase 10 v1 added: +1 FFI flag/entrypoint-mismatch regression
                                 + 1 FFI Isp/g0=0 rejection
                                 + 1 FFI N=8/N=10 expanded-surface smoke test;
@@ -1148,6 +1175,7 @@ Tests:      125 passing across 5 crates + 2 integration suites + 3 API + 8 FFI t
                                  + 2 #[ignore]d N-sweep / tuning diagnostics;
                Phase 17 added:   + 1 lunar-gravity convergence (active-drag test
                                    upgraded in place to a convergence gate),
+                                 + 1 larger-N drag convergence gate (N=8),
                                  + 1 #[ignore]d envelope-widening sweep)
               (+22 vs phase-5 end: 5 block_tridiag + 7 reduced_kkt
                                  + 1 active-drag flight-envelope coverage

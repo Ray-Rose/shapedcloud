@@ -1590,13 +1590,19 @@ mod tests {
     }
 
     /// **Flight-envelope coverage: NON-MARS GRAVITY (lunar)**. The HANDOFF
-    /// flags changing gravity (Mars → lunar, only `g` differs) as a regime
-    /// outside the validated Mars no-drag sweet spot — the AHO endgame would
-    /// break down after a few outer iters. With the trust-shrink retry (plus
-    /// per-cone row scaling, which the weaker-gravity slack magnitudes need to
-    /// stay balanced) the lunar descent now converges to machine-precision
-    /// dynamics feasibility. The gravity-axis twin of
-    /// `scvx_active_drag_path_exercised_and_handled`. Measured min ‖ν‖ ≈ 3.5e-10.
+    /// flags changing gravity (Mars → lunar, "only `g` and `t_min` differ") as
+    /// a regime outside the validated Mars no-drag sweet spot — the AHO endgame
+    /// would break down after a few outer iters. With the trust-shrink retry
+    /// this converges to machine-precision dynamics feasibility on the
+    /// **production base config** (column preconditioning only — no cone-row, no
+    /// adaptive-reg), provided the thrust floor is scaled to the weaker gravity:
+    /// the Mars `t_min = 1000 N` forces the `σ − T_min` cone hard-active on a
+    /// lunar descent (a vanishing-cone stressor — that physical mismatch, NOT
+    /// the solver, is what makes a Mars-`t_min` lunar problem marginal at small
+    /// N), so this uses a gravity-appropriate deep-throttle floor
+    /// `t_min = 300 N` (~5% of `t_max`). Characterized across N ∈ {5,8,10} in
+    /// `diag_envelope_widening`. The gravity-axis twin of
+    /// `scvx_active_drag_path_exercised_and_handled`. Measured min ‖ν‖ ≈ 8.2e-11.
     #[test]
     fn scvx_converges_lunar_gravity() {
         run_in_big_stack(|| {
@@ -1607,8 +1613,14 @@ mod tests {
             const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
             const MAX_OUTER: usize = 15;
 
-            // Mars params, but with LUNAR gravity (only `g` differs).
-            let phys = PhysicalParams { g: [0.0, 0.0, -1.62], ..mars_params() };
+            // Mars params, but with LUNAR gravity and a gravity-appropriate
+            // deep-throttle thrust floor (Mars t_min=1000 N would force the
+            // σ−T_min cone hard-active on a lunar descent — see the docstring).
+            let phys = PhysicalParams {
+                g:     [0.0, 0.0, -1.62],
+                t_min: 300.0,
+                ..mars_params()
+            };
 
             let mut x_init = SVector::<f64, 7>::zeros();
             x_init[2] = 100.0;
@@ -1639,7 +1651,7 @@ mod tests {
                 tol_gap:              1.0e-3,
                 use_nt_scaling:       false,
                 use_preconditioning:  true,
-                use_cone_row_scaling: true,   // weaker-gravity slacks need it
+                use_cone_row_scaling: false,  // production base config
                 ..IpmAlgoParams::default()
             };
 
@@ -1669,7 +1681,7 @@ mod tests {
                 matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
                 "lunar status {} — expected Converged/OuterIterCap", status as u32,
             );
-            // Envelope claim: the lunar dynamics defect closes (measured ≈3.5e-10;
+            // Envelope claim: the lunar dynamics defect closes (measured ≈8.2e-11;
             // assert a conservative 1e-6 for cross-platform fp slack).
             assert!(
                 min_virt < 1.0e-6,
@@ -1682,6 +1694,91 @@ mod tests {
                 for i in 0..7 {
                     assert!(ws.reference.x[(i, k)].is_finite(),
                             "lunar ref.x[{i},{k}] not finite");
+                }
+                assert!(ws.reference.sigma[k].is_finite());
+            }
+        });
+    }
+
+    /// **Flight-envelope coverage: LARGER N (active drag, base config)**.
+    /// Proves the trust-shrink retry's envelope win is not an N=5 artifact:
+    /// active drag converges to machine-precision dynamics feasibility at a
+    /// flight-relevant node count (N=8) on the production base config (column
+    /// preconditioning only). Characterized across N ∈ {5,8,10} in
+    /// `diag_envelope_widening` (drag base min ‖ν‖: 1.6e-10 / 1.1e-9 / 2.0e-10);
+    /// this locks N=8 in as a permanent CI gate. Larger-N twin of
+    /// `scvx_active_drag_path_exercised_and_handled` (N=5).
+    #[test]
+    fn scvx_drag_converges_at_larger_n() {
+        run_in_big_stack(|| {
+            const N: usize         = 8;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 15;
+
+            let phys = PhysicalParams { rho: 0.02, cd_a: 50.0, ..mars_params() };
+
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 100.0;
+            x_init[5] = -10.0;
+            x_init[6] = (800.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (700.0_f64).ln();
+
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> =
+                Box::default();
+            ws.reference = linear_reference::<N>(x_init, x_target, 750.0, 25.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    50.0,
+                trust_eta_max: 200.0,
+                trust_eta_min: 1.0e-3,
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                max_iters:            50,
+                tol_mu:               1.0e-3,
+                tol_primal:           1.0e-3,
+                tol_dual:             1.0e-3,
+                tol_gap:              1.0e-3,
+                use_nt_scaling:       false,
+                use_preconditioning:  true,
+                use_cone_row_scaling: false,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut ws, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = ws.iter as usize;
+            let hi = last.min(ws.history.len().saturating_sub(1));
+            let mut min_virt = f64::INFINITY;
+            for i in 0..=hi {
+                let r = &ws.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+            }
+            eprintln!("drag-N{N}: status={} outer={} min‖ν‖={:.3e}",
+                      status as u32, last + 1, min_virt);
+
+            assert!(!matches!(status, SolverStatus::BadInput),
+                    "drag N={N} returned BadInput");
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "drag N={N} status {} — expected Converged/OuterIterCap", status as u32,
+            );
+            assert!(
+                min_virt < 1.0e-6,
+                "drag N={N} defect did not close: min‖ν‖ = {min_virt:.3e} \
+                 (expected < 1e-6)",
+            );
+            for k in 0..N {
+                for i in 0..7 {
+                    assert!(ws.reference.x[(i, k)].is_finite(),
+                            "drag N={N} ref.x[{i},{k}] not finite");
                 }
                 assert!(ws.reference.sigma[k].is_finite());
             }
@@ -1732,13 +1829,6 @@ mod tests {
     #[ignore = "diagnostic envelope sweep; run with --ignored --nocapture"]
     fn diag_envelope_widening() {
         run_in_big_stack(|| {
-            const N: usize         = 5;
-            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
-            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
-            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
-            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
-            const MAX_OUTER: usize = 15;
-
             let mut x_init = SVector::<f64, 7>::zeros();
             x_init[2] = 100.0;   // 100 m altitude
             x_init[5] = -10.0;   // −10 m/s descent
@@ -1768,37 +1858,58 @@ mod tests {
             // (label, phys, reference vertical-gravity for the hover seed)
             let mars_drag = PhysicalParams { rho: 0.02, cd_a: 50.0, ..mars_params() };
             let lunar     = PhysicalParams { g: [0.0, 0.0, -1.62], ..mars_params() };
-            let scenarios: [(&str, PhysicalParams, f64); 2] = [
-                ("drag ", mars_drag, mars_params().g[2]),
-                ("lunar", lunar,     -1.62),
+            // Lunar with a thrust floor scaled to its weaker gravity. Mars
+            // t_min=1000 N forces the σ−T_min cone hard-active on a lunar
+            // descent (hover ≈ 324 N at m_dry), a vanishing-cone stressor;
+            // a deep-throttle floor (~5% t_max) removes it.
+            let lunar_lo  = PhysicalParams { g: [0.0, 0.0, -1.62], t_min: 300.0, ..mars_params() };
+            let scenarios: [(&str, PhysicalParams, f64); 3] = [
+                ("drag    ", mars_drag, mars_params().g[2]),
+                ("lunar   ", lunar,     -1.62),
+                ("lunarLoT", lunar_lo,  -1.62),
             ];
-            // (label, adaptive_reg, cone_row_scaling)
-            let configs: [(&str, bool, bool); 4] = [
-                ("base             ", false, false),
-                ("+adaptReg        ", true,  false),
-                ("+coneRow         ", false, true ),
-                ("+adaptReg+coneRow", true,  true ),
+            // (label, adaptive_reg, cone_row_scaling). adaptReg is ruled out
+            // (over-regularizes the vanishing-cone boundary, breaks iter 0).
+            let configs: [(&str, bool, bool); 2] = [
+                ("base    ", false, false),
+                ("+coneRow", false, true ),
             ];
 
-            eprintln!("=== ENVELOPE SWEEP (N={N}) — status 0=Conv 1=OuterCap 2=InnerFail | \
+            eprintln!("=== ENVELOPE SWEEP — status 0=Conv 1=OuterCap 2=InnerFail | \
                        lastIPM 0=Opt 1=Best 2=Infeas 3=NumErr 4=IterCap ===");
-            for (slabel, phys, g_z) in &scenarios {
-                for (clabel, areg, crow) in &configs {
-                    let reference =
-                        linear_reference_g::<N>(x_init, x_target, 750.0, 25.0, *g_z);
-                    let ipm = IpmAlgoParams {
-                        use_adaptive_regularization: *areg,
-                        use_cone_row_scaling:        *crow,
-                        ..base_ipm
-                    };
-                    let (st, oi, nu, lipm) =
-                        diag_run_case::<N, NP, NE, NCT, NCONES, MAX_OUTER>(
-                            phys, reference, &x_init, &term, &algo, &ipm,
-                        );
-                    eprintln!("  {slabel}  {clabel}  status={st}  outer={oi:>2}  \
-                               min‖ν‖={nu:>10.3e}  lastIPM={lipm}");
-                }
+            // N is compile-time; a small macro re-runs the scenario × config
+            // grid at each flight-relevant node count to confirm the
+            // trust-shrink retry generalizes beyond the N=5 demo.
+            macro_rules! sweep_for_n {
+                ($n:literal) => {{
+                    const N: usize         = $n;
+                    const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+                    const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+                    const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+                    const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+                    const MAX_OUTER: usize = 20;
+                    for (slabel, phys, g_z) in &scenarios {
+                        for (clabel, areg, crow) in &configs {
+                            let reference = linear_reference_g::<N>(
+                                x_init, x_target, 750.0, 25.0, *g_z);
+                            let ipm = IpmAlgoParams {
+                                use_adaptive_regularization: *areg,
+                                use_cone_row_scaling:        *crow,
+                                ..base_ipm
+                            };
+                            let (st, oi, nu, lipm) =
+                                diag_run_case::<N, NP, NE, NCT, NCONES, MAX_OUTER>(
+                                    phys, reference, &x_init, &term, &algo, &ipm,
+                                );
+                            eprintln!("  N={:>2} {slabel} {clabel} status={st} \
+                                       outer={oi:>2} min‖ν‖={nu:>10.3e} lastIPM={lipm}", N);
+                        }
+                    }
+                }};
             }
+            sweep_for_n!(5);
+            sweep_for_n!(8);
+            sweep_for_n!(10);
         });
     }
 
