@@ -12,8 +12,8 @@ a context-window roll-over so the next session starts coherent.
   trajectory-optimization solver for **3-DoF powered descent** with drag and
   free-final-time. Static-memory, no-`std`, no-`alloc`, no-`panic`,
   bounded-WCET — "research-grade flight-shaped" per the original plan.
-- **Where**: `<repo-root>`
-- **State**: **124 tests pass** across **5 crates**,
+- **Where**: the repository workspace root (all paths below are repo-relative)
+- **State**: **125 tests pass** across **5 crates**,
   `cargo clippy --all-targets -- -D warnings` clean,
   `cargo build --release --target thumbv7em-none-eabihf -p scvx-solver`
   clean (the no_std flight crates cross-compile to ARM Cortex-M), and the
@@ -186,29 +186,32 @@ a context-window roll-over so the next session starts coherent.
      correctness; the structured fast path delivers its speedup on the
      ~2/3 of subproblems where it succeeds.
   3. **Widen the convergence envelope beyond the Mars no-drag sweet spot**
-     (Phase 7 finding). The shipping default (AHO + column preconditioning)
-     converges cleanly on the Mars no-drag small-scale demo (15 iters,
-     status 1), but adding **active drag** (`rho=0.02, cd_a=50`) or changing
-     **gravity** (Mars→lunar, only `g` + `t_min` differ) triggers the AHO
-     endgame breakdown after a few outer iters — even though the
-     preconditioning scale table is *identical* (it's driven by `x_init`
-     magnitudes + `t_max`, not gravity, verified). So this is **not** a
-     preconditioning bug; it is the same AHO IPM endgame fragility as item 1,
-     surfaced by a wider problem regime. The drag/gravity *code paths* are
-     correct and exercised (the active-drag test makes real progress —
-     cost halves, ‖ν‖ drops — for 5 iters before breakdown); what's missing
-     is convergence *robustness* across the envelope. The cure is the same
-     as item 1: NT scaling (or a more robust AHO endgame), which removes the
-     `arrow(s)·arrow(y) → singular` degeneracy. Until then, the validated
-     production envelope is the Mars no-drag regime; drag/non-Mars problems
-     run and are handled gracefully (no panic/NaN) but may hit `InnerFailure`.
+     (Phase 7 finding) — **ADDRESSED for drag + non-Mars gravity by the
+     Phase 17 trust-shrink retry** (see the Phase 17 section). The old framing:
+     the shipping default (AHO + column preconditioning) converged cleanly on
+     Mars no-drag, but **active drag** (`rho=0.02, cd_a=50`) or a **gravity
+     change** (Mars→lunar) tripped the AHO endgame after a few outer iters and
+     the outer loop *aborted* (`InnerFailure`). The root cause was NOT the
+     drag/gravity code paths (correct + exercised) nor preconditioning (scale
+     table is identical) — it was the outer loop **giving up on the first
+     unsolvable subproblem** instead of shrinking the trust and re-solving.
+     Phase 17 makes that the standard trust-region retry: **active drag now
+     reaches min ‖ν‖ = 1.58e-10 (base AHO + column precond); lunar reaches
+     3.45e-10 (+ cone-row scaling)** — machine-precision dynamics feasibility,
+     vs the old `InnerFailure` at ‖ν‖ ≈ 0.4–0.7. Asserted in
+     `scvx_active_drag_path_exercised_and_handled` (upgraded to a convergence
+     gate) and the new `scvx_converges_lunar_gravity`. **Remaining**: the
+     solver reaches ‖ν‖→0 but `OuterIterCap`s (it oscillates around the optimum
+     at large `eta_max` rather than formally `Converged`), and problems the
+     retry can't tame still bottom out on the item-1 vanishing-cone endgame —
+     the deeper frontier.
 
 ---
 
 ## Quick verification (run this first to confirm baseline)
 
 ```sh
-cd "<repo-root>"
+cd <repo-root>   # the workspace root of this repository
 cargo test 2>&1 | grep -E "test result"
 cargo clippy --all-targets -- -D warnings
 cargo build --release --target thumbv7em-none-eabihf
@@ -252,7 +255,7 @@ Docker (Docker Desktop with the linux/amd64 engine is present on this host):
 # From the repo root. CARGO_TARGET_DIR is set to a container-local path so the
 # Linux build never collides with the Windows MSVC target/ cache (and vice versa).
 MSYS_NO_PATHCONV=1 docker run --rm \
-  -v "<repo-root>":/work \
+  -v "<ABSOLUTE_PATH_TO_REPO_ROOT>":/work \
   -w /work -e CARGO_TARGET_DIR=/build-target rust:1.94-bookworm \
   bash -c "cargo test --workspace 2>&1 | grep 'test result' && \
            cargo run --release --example mars_descent 2>&1 | grep -E 'Status|Final cost|τ'"
@@ -1068,15 +1071,84 @@ thumb (solver+FFI); example deterministic.
 
 ---
 
+## Phase 17 — convergence-envelope widening (forward item #3, LANDED)
+
+Makes the AHO **production** path converge on **active-drag** and **non-Mars-
+gravity (lunar)** descents — the two regimes the prior envelope explicitly
+excluded (TL;DR open item #3) — without touching the validated Mars no-drag path.
+
+- **Root cause, re-confirmed from a live trace (not assumed).** On the
+  active-drag N=5 case the inner AHO IPM hits its endgame on ONE over-aggressive
+  subproblem (the trust had run to `eta_max`, warm-started from a far
+  candidate); it returns `IterCap`/`NumericalError` with no best-feasible
+  snapshot, and the outer loop **aborted outright** (`return InnerFailure`),
+  discarding the entire remaining outer-iteration budget. That abort — not the
+  single hard subproblem — is what capped the envelope. (Confirmed: status was
+  `IterCap`/`best_valid=false`, not a NaN leak.)
+- **Fix — one site, `scvx.rs::solve_scvx` inner-failure handler.** The standard
+  trust-region response to an unsolvable subproblem: on `!inner_ok`, **shrink
+  the trust radius (`trust_eta /= trust_alpha`) and re-solve the SAME outer
+  iterate** (the reference is unchanged ⇒ a tighter, better-conditioned,
+  smaller-linearization-gap subproblem), instead of aborting. Give up
+  (`InnerFailure`) only once the trust has collapsed to its floor and the
+  subproblem is STILL unsolvable. Bounded by the geometric shrink-to-floor and
+  the outer-iteration cap; no new alloc/unsafe/panic; no_std-clean.
+- **Measured** (N=5, 100 m / −10 m/s / 800 kg):
+
+  | regime | before (abort) | after (retry) |
+  |--------|----------------|---------------|
+  | active drag (`rho=0.02, cd_a=50`), AHO + column precond | `InnerFailure` @ outer 3, ‖ν‖ ≈ 0.42 | min ‖ν‖ = **1.58e-10** |
+  | lunar (`g=−1.62`), AHO + column precond + cone-row scaling | `InnerFailure` @ outer 3, ‖ν‖ ≈ 0.71 | min ‖ν‖ = **3.45e-10** |
+
+  Both reach machine-precision dynamics feasibility — drag on the base
+  AHO+column-precond config; lunar additionally needs cone-row scaling for its
+  weaker-gravity slack magnitudes.
+- **Honest scope.** The solver reaches ‖ν‖→0 but terminates `OuterIterCap`, not
+  formally `Converged`: at `eta_max=200` the step keeps moving (`dx_du >
+  conv_tol_x`), so it oscillates around the optimum after hitting feasibility.
+  `min ‖ν‖` over accepted iters is the convergence-quality metric (same bar as
+  `scvx_converges_larger_n_adaptive_trust`). Damping that residual oscillation
+  into a formal `Converged` would need an `eta_max`/stationarity-aware trust
+  rule — a bounded future refinement, not required for the envelope claim.
+- **Tried and REVERTED (measured dead-end, recorded so it isn't re-treaded).**
+  Holding the trust on the forced iter-0 (its ρ=1 is synthetic, and the in-code
+  comment already *claimed* it "neither shrinks nor grows") **traded regimes**:
+  lunar-base then converged (5.7e-12) but drag-base and lunar+cone-row regressed
+  (0.28 / 0.66). The forced iter-0 growth is *incidentally load-bearing* — it
+  gives the early subproblems room before the adaptive-trust gate can react,
+  preventing premature trust collapse. Reverted; the retry alone covers both
+  regimes.
+- **Config levers ruled out** (`diag_envelope_widening`, a new `#[ignore]`d
+  sweep): adaptive Tikhonov regularization and cone-row scaling do NOT by
+  themselves widen the AHO envelope — `use_adaptive_regularization`
+  over-regularizes at the vanishing-cone boundary and breaks iter 0 (confirming
+  the existing docstring warning); cone-row scaling helps lunar specifically but
+  hurts drag. Only the outer-loop retry generalizes.
+- **Tests.** `scvx_active_drag_path_exercised_and_handled` **upgraded** from
+  graceful-handling to a convergence gate (status ∈ {Converged, OuterIterCap},
+  min ‖ν‖ < 1e-6, `InnerFailure` no longer acceptable). New
+  `scvx_converges_lunar_gravity` (lunar + cone-row, min ‖ν‖ < 1e-6). New
+  `#[ignore]`d `diag_envelope_widening` characterization sweep. The retry
+  triggers ONLY on inner failure, which the Mars-regime tests never hit, so all
+  prior tests are byte-for-byte unaffected.
+- **Verification:** 125 tests pass (was 124; +1 lunar convergence, drag upgraded
+  in place, +1 ignored diagnostic), clippy `-D warnings` clean, thumb (solver)
+  cross-compile clean. Mars no-drag path unchanged.
+
+---
+
 ## Final state summary
 
 ```
-Tests:      124 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
+Tests:      125 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
               (Phase 10 v1 added: +1 FFI flag/entrypoint-mismatch regression
                                 + 1 FFI Isp/g0=0 rejection
                                 + 1 FFI N=8/N=10 expanded-surface smoke test;
                Phase 11 added:   + 1 larger-N convergence (N=10 tuned trust),
-                                 + 2 #[ignore]d N-sweep / tuning diagnostics)
+                                 + 2 #[ignore]d N-sweep / tuning diagnostics;
+               Phase 17 added:   + 1 lunar-gravity convergence (active-drag test
+                                   upgraded in place to a convergence gate),
+                                 + 1 #[ignore]d envelope-widening sweep)
               (+22 vs phase-5 end: 5 block_tridiag + 7 reduced_kkt
                                  + 1 active-drag flight-envelope coverage
                                  + 1 solve_socp_structured live-driver equivalence
