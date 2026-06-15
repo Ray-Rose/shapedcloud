@@ -18,6 +18,14 @@
 //! Per the plan, the SCvx subproblem's FOH B-split (`B⁻`, `B⁺`) is *not*
 //! handled here yet — that's a P3 concern when we fuse the Riccati into the
 //! IPM. P2 is the standalone single-B LQR primitive.
+//!
+//! **STATUS — standalone primitive, NOT wired into the shipped solver.** The
+//! production structured-KKT path (`scvx_solver::reduced_kkt`) reimplements the
+//! block-Thomas sweep inline over the SCvx FOH layout; this Riccati module is
+//! exercised only by its own unit tests and the WCET benchmark, kept as a
+//! verified reference / future-fusion primitive. The "whole point" / flight-
+//! WCET framing above is the algorithmic motivation, not a claim that this
+//! code runs on a live solve path.
 
 use nalgebra::{SMatrix, SVector};
 

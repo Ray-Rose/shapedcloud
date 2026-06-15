@@ -561,7 +561,7 @@ For someone picking up cold, read in this order (rough times noted):
 | No `unsafe` anywhere                                | `#![forbid(unsafe_code)]` on 3/4, scvx-ipm has zero unsafe in source |
 | No NaN propagation from IPM to caller               | `numerical_exit` scrubs NaN to 0.0      |
 | No clamp-panic on bad params                        | Entry validation in `solve_scvx` (6-attack regression test) |
-| Bounded WCET (per IPM iter)                         | Hard `max_iters = 25` cap               |
+| Bounded WCET (per IPM iter)                         | IPM loop bounded by caller `max_iters` (default 25; SCvx/FFI callers pass ≤ 50) |
 | Bounded outer loop iterations                       | `min(algo.max_outer_iters, MAX_OUTER)`  |
 | τ preserved across SCvx iterations                  | Explicit `preserved_tau` capture; regression test |
 | Iterate magnitude bounded                           | `>1e50` check in IPM → `numerical_exit` |
@@ -1161,6 +1161,45 @@ N=5 artifact and pins down the lunar marginality:
   range. Cone-row scaling helps lunar ONLY in the mis-specified-`t_min` regime
   and hurts elsewhere; adaptive-reg stays ruled out (over-regularizes the
   vanishing-cone boundary, breaks iter 0).
+
+---
+
+## Phase 18 — deployability consolidation (docs only, zero behavior change)
+
+A pure-documentation pass to lock in the Phase-17 envelope win for integrators
+and clear the doc-truth nits the alignment audits flagged. NO production logic
+changed; all 126 tests, clippy `-D warnings`, and the thumb cross-compile are
+unchanged.
+
+- **`t_min`-must-scale-with-gravity footgun documented** (the load-bearing
+  deployability item from the Phase-17 follow-up). A `t_min` set too high for
+  the local gravity (hover thrust ≲ `t_min`) drives the `σ ≥ T_min` cone
+  hard-active and stresses the IPM endgame — a *modeling* mismatch the input
+  validator can't catch. Now called out on `PhysicalParams::t_min` (`params.rs`)
+  and in `INTEGRATION.md` §5.1, with the Mars-`1000` → lunar-`300` worked
+  example.
+- **`INTEGRATION.md` §10 validation scope updated** to the Phase-17 reality:
+  convergence validated for Mars no-drag, active drag at N = 5/8/10, and lunar
+  gravity at N = 5/8/10 on the production default config (reaching
+  `OUTER_ITER_CAP` with a feasible trajectory, not formal `CONVERGED`).
+- **Vestigial-primitive docstrings corrected** (audit doc-truth): `kkt.rs`
+  (Riccati) and `block_tridiag.rs` carried "the whole point / flight WCET must
+  use this" framing that read as load-bearing — both are standalone, test-only
+  references; the shipped structured path reimplements block-Thomas inline in
+  `scvx_solver::reduced_kkt`. `assemble.rs`'s module header now flags that its
+  layout doc describes the *vestigial* LCvx assembler, not the production
+  `assemble_scvx_socp`.
+- **iter-0 trust comment corrected**: it claimed the forced ρ = 1 "neither
+  shrinks nor grows" — Phase 17 proved it GROWS the trust and that the growth is
+  load-bearing. The comment now states this and warns against "fixing" it.
+- **WCET claim made honest**: the safety table said "Hard `max_iters = 25` cap";
+  the IPM loop is in fact bounded by the caller-supplied `max_iters` (default 25;
+  SCvx/FFI callers pass ≤ 50).
+
+**Noted follow-ups** (not done here): a compile-time IPM `max_iters` hard cap
+(makes the WCET bound caller-independent — a small production change + full
+gate); external-oracle coverage for the SCvx outer loop / free-tf / NT (today
+only the dense-AHO toy SOCP has a baked CVXPY/Julia oracle).
 
 ---
 

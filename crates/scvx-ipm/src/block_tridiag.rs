@@ -20,6 +20,12 @@
 //! `O((N·NX)³)`; the block-tridiagonal path is `O(N·NX³)` — a flight WCET
 //! must use the latter.
 //!
+//! **STATUS — standalone primitive, NOT wired into the shipped solver.** The
+//! production path (`scvx_solver::reduced_kkt`) reimplements this block-Thomas
+//! sweep inline, specialized to the SCvx layout; this generic module is
+//! exercised only by its own unit tests and the dense-LU oracle, kept as the
+//! verified reference for that inline code.
+//!
 //! `D_k` blocks are expected to be **symmetric PD** in normal use (they're
 //! diagonal blocks of `A·H⁻¹·Aᵀ`). The factorization works as long as
 //! `D̃_k = D_k - L_{k-1}·D̃_{k-1}⁻¹·U_{k-1}` is invertible at every stage.

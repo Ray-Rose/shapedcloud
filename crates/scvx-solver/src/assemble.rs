@@ -5,6 +5,14 @@
 //! "impedance match" piece — everything downstream of P5 (dynamics) and
 //! P3a (generic IPM) hangs off the result.
 //!
+//! **STATUS — two assemblers live in this module.** [`assemble_scvx_socp`]
+//! (19 vars/node, 8 cones, `NP = 19N`) is the **production** SCvx assembly the
+//! outer loop calls every iteration; its layout is documented on that function
+//! and in `HANDOFF.md`. [`assemble_lcvx_socp`] — the 11-var/6-cone LCvx layout
+//! described below — is a **vestigial** prototype, exercised only by unit tests
+//! and the WCET benchmark, never on the live SCvx path. The layout sections in
+//! THIS header describe the LCvx assembler, not the production one.
+//!
 //! ## Variable layout
 //!
 //! Per temporal node `k = 0..N-1`:

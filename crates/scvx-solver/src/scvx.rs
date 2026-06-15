@@ -591,9 +591,16 @@ pub fn solve_scvx<
         //
         // Iter ≥ 1: standard LM ρ.
         let rho = if k == 0 {
-            // Forced accept on iter 0 — encode as ρ = 1 so the trust
-            // adapter neither shrinks nor grows. The accept decision
-            // below is gated on finiteness, not ρ.
+            // Forced accept on iter 0 (no valid merit yet: the initial
+            // reference may be dynamically inconsistent, so `j_prev` is
+            // undefined). The accept decision below is gated on finiteness,
+            // not ρ. NB: encoding ρ = 1 makes the trust adapter GROW the
+            // radius on iter 0 (1.0 > rho_grow). This is intentional and
+            // load-bearing — Phase 17 measured that holding the trust here
+            // (an earlier comment wrongly claimed it "neither shrinks nor
+            // grows") regresses the drag/lunar envelope: the early
+            // subproblems need room before the adaptive-trust gate reacts.
+            // Don't change this to hold without re-running the envelope tests.
             1.0
         } else {
             let predicted_reduction = workspace.j_prev - l_predicted;

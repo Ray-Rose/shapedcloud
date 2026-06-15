@@ -178,6 +178,18 @@ workspace). This is enforced at the boundary *and* inside the solver.
 value would inject NaN/Inf into the linearization, so they are validated to be
 strictly positive.
 
+**Scale `t_min` to your gravity regime.** `t_min` is a hard floor on thrust
+magnitude (the `σ ≥ T_min` cone), accepted as long as it is finite and `>= 0` —
+but a value physically too high for the local gravity hurts *convergence*, which
+the boundary check cannot catch. If hover thrust at low mass (`m_dry · ‖g‖`)
+falls near or below `t_min`, the floor cone rides hard against its boundary and
+stresses the IPM endgame. Keep `t_min` at the engine's true deep-throttle floor
+(often ~5–10% of `t_max`), not a value copied from a different-gravity mission.
+Example: `t_min = 1000 N` is correct on Mars (g ≈ 3.71) but too high for the same
+vehicle on the Moon (g ≈ 1.62, hover ≈ 324 N at dry mass) — use ~`300 N` there.
+With gravity-appropriate limits the solver converges to machine-precision
+feasibility on both drag and off-Mars regimes (see HANDOFF "Phase 17").
+
 ### 5.2 `initial_state` — 7 doubles
 
 `[r_x, r_y, r_z, v_x, v_y, v_z, ln(m)]`. Position (m), velocity (m/s), and the
@@ -279,14 +291,20 @@ Row-major, node-indexed (`k = 0 .. N-1`). Layout mirrors the Rust side exactly:
 
 ## 10. Validation status (honest scope)
 
-- Convergence is validated by the test suite for **N ≤ 5** (fixed- and free-tf,
-  with drag and across gravity regimes).
-- Larger `N` entrypoints (8, 10, 12, 15, 20) are provided and are verified to
-  **run end-to-end and never crash or emit NaN/Inf**, but convergence on a given
-  problem is best-effort — expect `OUTER_ITER_CAP` on hard large-`N` cases.
-  Tune `max_outer_iters`, the trust-region parameters, and your reference seed
-  for your specific mission, and validate against your own scenarios before
-  flight.
+- Convergence (to machine-precision dynamics feasibility, min ‖ν‖ < 1e-6) is
+  validated by the test suite for: the Mars no-drag regime (fixed- and free-tf);
+  **active drag at N = 5 / 8 / 10**; and **non-Mars (lunar) gravity at
+  N = 5 / 8 / 10** — all on the production default config (column
+  preconditioning), with thrust limits scaled to the gravity regime (§5.1).
+  These reach `OUTER_ITER_CAP` carrying a feasible trajectory, not formal
+  `CONVERGED`. The outer loop shrinks the trust radius and re-solves an
+  unsolvable subproblem rather than aborting, which is what carries the drag /
+  off-Mars regimes through the IPM endgame (HANDOFF "Phase 17").
+- Other large-`N` cases (N = 12 / 15 / 20, and untested problem regimes) are
+  provided and verified to **run end-to-end and never crash or emit NaN/Inf**,
+  but convergence is best-effort — expect `OUTER_ITER_CAP` on hard cases. Tune
+  `max_outer_iters`, the trust-region parameters, and your reference seed for
+  your specific mission, and validate against your own scenarios before flight.
 - This is research-grade flight *software engineering* (MISRA-like discipline,
   no_std, no_alloc, bounded WCET, deterministic), not a flight-qualified product.
   Qualification (DO-178C / NPR 7150.2 etc.) is the integrator's responsibility.

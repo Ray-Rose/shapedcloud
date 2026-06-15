@@ -6,7 +6,15 @@ pub struct PhysicalParams {
     pub m_wet:         f64,      // initial mass upper bound, kg
     pub isp:           f64,      // specific impulse, s
     pub g0:            f64,      // standard gravity for Isp normalization, m/s²
-    pub t_min:         f64,      // thrust magnitude lower bound, N
+    /// Thrust-magnitude lower bound, N (the `σ ≥ T_min` cone). **Scale this to
+    /// your gravity regime** — set it near the engine's true deep-throttle floor
+    /// (often ~5–10% of `t_max`), not a value copied from a different-gravity
+    /// mission. If `t_min` exceeds the vehicle's weight in the local gravity
+    /// (hover thrust near or below `t_min`), the floor cone rides hard against
+    /// its boundary and stresses the IPM endgame, hurting convergence — a
+    /// modeling mismatch, not a solver bug. E.g. Mars `1000` is too high for the
+    /// same vehicle on the Moon (lower to ~`300`). See HANDOFF "Phase 17".
+    pub t_min:         f64,      // N
     pub t_max:         f64,      // thrust magnitude upper bound, N
     pub cos_theta_max: f64,      // cos of thrust pointing half-angle
     pub tan_gamma_gs:  f64,      // tan of glide-slope angle (from horizontal)
