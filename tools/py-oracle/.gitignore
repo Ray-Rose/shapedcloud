@@ -1,0 +1,7 @@
+# This directory is a machine-specific Python virtualenv (CVXPY + Clarabel).
+# Ignore the venv contents, but keep the oracle SCRIPTS — they are real source
+# and the baked oracle reference values depend on them.
+*
+!.gitignore
+!solve_canonical.py
+!solve_scvx_subproblem.py
