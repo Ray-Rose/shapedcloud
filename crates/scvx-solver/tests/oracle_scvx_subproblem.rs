@@ -37,7 +37,7 @@
 use nalgebra::SVector;
 use scvx_core::{IpmAlgoParams, IpmStatus, PhysicalParams, Trajectory, G_MARS};
 use scvx_dynamics::{discretize_foh, LinearizedDynamics};
-use scvx_ipm::{solve_socp, SocpProblem, SocpResult, SocpWorkspace};
+use scvx_ipm::{solve_socp, solve_socp_nt, SocpProblem, SocpResult, SocpWorkspace};
 use scvx_solver::{
     assemble_scvx_socp, build_cone_scale_diagonal, build_scaling_diagonal,
     scale_cone_rows_in_place, scale_socp_in_place, scale_warm_start_in_place,
@@ -89,10 +89,10 @@ fn scenario_phys() -> PhysicalParams {
     }
 }
 
-fn scenario_initial() -> SVector<f64, 7> {
+fn scenario_initial(alt: f64) -> SVector<f64, 7> {
     let mut x = SVector::<f64, 7>::zeros();
-    x[2] = 100.0; // r_z = 100 m
-    x[5] = -10.0; // v_z = -10 m/s
+    x[2] = alt; // r_z (m)
+    x[5] = -0.1 * alt; // v_z (m/s) — descent rate proportional to altitude
     x[6] = (800.0_f64).ln(); // m = 800 kg
     x
 }
@@ -147,12 +147,11 @@ fn seed_warm_start<const NP: usize>(reference: &Trajectory<N>) -> SVector<f64, N
 /// Build the **preconditioned, fixed-tf** iter-0 subproblem plus its scaled
 /// warm-start primal — exactly what `solve_scvx` feeds the inner IPM at iter 0
 /// with `use_preconditioning = true`, `use_free_tf = false`.
-fn build_fixture_fixedtf() -> (
-    Box<SocpProblem<NP_FX, NE, NCT_FX, NCONES_FX>>,
-    SVector<f64, NP_FX>,
-) {
+fn build_fixture_fixedtf(
+    alt: f64,
+) -> (Box<SocpProblem<NP_FX, NE, NCT_FX, NCONES_FX>>, SVector<f64, NP_FX>) {
     let phys = scenario_phys();
-    let initial = scenario_initial();
+    let initial = scenario_initial(alt);
     let terminal = scenario_terminal();
     let reference = seed_reference(&phys, &initial);
 
@@ -185,12 +184,11 @@ fn build_fixture_fixedtf() -> (
 
 /// Build the **preconditioned, free-tf** iter-0 subproblem (adds the global δτ
 /// variable and the two τ-bound cones).
-fn build_fixture_freetf() -> (
-    Box<SocpProblem<NP_FT, NE, NCT_FT, NCONES_FT>>,
-    SVector<f64, NP_FT>,
-) {
+fn build_fixture_freetf(
+    alt: f64,
+) -> (Box<SocpProblem<NP_FT, NE, NCT_FT, NCONES_FT>>, SVector<f64, NP_FT>) {
     let phys = scenario_phys();
-    let initial = scenario_initial();
+    let initial = scenario_initial(alt);
     let terminal = scenario_terminal();
     let reference = seed_reference(&phys, &initial);
 
@@ -271,9 +269,9 @@ fn dump_problem<const NP: usize, const NE2: usize, const NCT: usize, const NCONE
 #[test]
 #[ignore]
 fn dump_oracle_fixtures() {
-    let (fx, _) = build_fixture_fixedtf();
+    let (fx, _) = build_fixture_fixedtf(100.0);
     dump_problem("fixedtf", &fx);
-    let (ft, _) = build_fixture_freetf();
+    let (ft, _) = build_fixture_freetf(100.0);
     dump_problem("freetf", &ft);
 }
 
@@ -362,9 +360,53 @@ fn run_aho<const NP: usize, const NE2: usize, const NCT: usize, const NCONES: us
     solve_socp(prob, &params, &mut ws)
 }
 
+fn run_nt<const NP: usize, const NE2: usize, const NCT: usize, const NCONES: usize>(
+    prob: &SocpProblem<NP, NE2, NCT, NCONES>,
+    warm: &SVector<f64, NP>,
+) -> SocpResult<NP, NE2, NCT> {
+    let mut ws = Box::<SocpWorkspace<NP, NE2, NCT>>::default();
+    ws.x = *warm;
+    let params = IpmAlgoParams { warm_start_x: true, max_iters: 60, ..IpmAlgoParams::default() };
+    solve_socp_nt(prob, &params, &mut ws)
+}
+
+/// Diagnostic (ignored): NT vs AHO across subproblem difficulty (altitude).
+///
+/// **Measured finding (the NT-frontier result).** With the exact closed-form
+/// NT scaling (`soc_nt_scaling_exact`, numerically stable for vanishing cones —
+/// it eliminates the geometric-mean `arrow(s)^{−1/2}` overflow), NT STILL
+/// diverges at every altitude: primal infeasibility `|Ax-b|` *grows* from the
+/// warm start to ~9-29 and the duality gap explodes (`s·y/n` ~ 1e12-1e14),
+/// while AHO reaches BestFeasible. This independently confirms and refines the
+/// Phase-15 conclusion: the per-cone scaling is NOT the bottleneck (the exact
+/// canonical scaling does not help) — the barrier is the global NT Newton
+/// direction / centering on the imbalanced vanishing-cone structure (the
+/// virtual-control SOC^8 cones carry `μ_cone ~ 1e-4` while thrust/trust carry
+/// ~1e7, so `H = GᵀW²G` is catastrophically ill-conditioned). A real fix needs
+/// a wide-neighborhood / per-cone-balanced centering scheme (IPM research), not
+/// a better scaling. AHO stays the production default; NT stays opt-in.
+#[test]
+#[ignore]
+fn diag_nt_on_flight_subproblem() {
+    // status: 0=Optimal 1=BestFeasible 2=Infeasible 3=NumericalError 4=IterCap
+    eprintln!("alt(m)|dir| st it |       cost       | |Ax-b|  |Gx+s-h| s·y/n");
+    for &alt in &[2.0, 10.0, 50.0, 100.0] {
+        let (p, w) = build_fixture_fixedtf(alt);
+        for (dir, r) in [("AHO", run_aho(&p, &w)), ("NT ", run_nt(&p, &w))] {
+            let r_a = (p.a_mat * r.x - p.b).norm();
+            let r_g = (p.g_mat * r.x + r.s - p.h).norm();
+            let compl = (r.s.dot(&r.y)).abs() / (NCT_FX as f64);
+            eprintln!(
+                "{alt:>5} |{dir}| {:>2} {:>2} | {:>15.6e} | {r_a:.1e} {r_g:.1e} {compl:.1e}",
+                r.status.as_u32(), r.iters, cost(&p, &r)
+            );
+        }
+    }
+}
+
 #[test]
 fn rust_ipm_matches_external_oracle_scvx_fixedtf() {
-    let (prob, warm) = build_fixture_fixedtf();
+    let (prob, warm) = build_fixture_fixedtf(100.0);
     let res = run_aho(&prob, &warm);
     eprintln!(
         "fixedtf: status={} iters={} cost={:.10e}",
@@ -390,7 +432,7 @@ fn rust_ipm_matches_external_oracle_scvx_fixedtf() {
 
 #[test]
 fn rust_ipm_matches_external_oracle_scvx_freetf() {
-    let (prob, warm) = build_fixture_freetf();
+    let (prob, warm) = build_fixture_freetf(100.0);
     let res = run_aho(&prob, &warm);
     eprintln!(
         "freetf: status={} iters={} cost={:.10e}",

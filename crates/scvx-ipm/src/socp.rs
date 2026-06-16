@@ -33,7 +33,7 @@ use scvx_core::{IpmAlgoParams, IpmStatus};
 
 use crate::cone::{
     soc_arrow_matrix, soc_in_interior, soc_jordan_product, soc_max_step,
-    soc_nt_w_and_inverse, soc_w_squared,
+    soc_nt_scaling_exact, soc_nt_w_and_inverse, soc_w_squared,
 };
 
 // ---------------------------------------------------------------------------
@@ -428,7 +428,16 @@ fn build_nt_block_for_cone<const NCT: usize>(
                 s_vec[i] = s_c[i];
                 y_vec[i] = y_c[i];
             }
-            let (w_c, w_inv_c) = match $compute(&s_vec, &y_vec) {
+            // Exact closed-form NT scaling (normalized-point boost form) is the
+            // primary path — it stays numerically bounded as the cone vanishes
+            // (the SCvx virtual-control relaxation drives ν→0, so its SOC^8
+            // cones ride onto their boundary at the optimum, where the
+            // geometric-mean `arrow(s)^{−1/2}` overflows). Fall back to the
+            // eigendecomp / Denman-Beavers matrix-sqrt of the geometric-mean
+            // form only if the exact path declines (non-interior iterate).
+            let (w_c, w_inv_c) = match soc_nt_scaling_exact::<$D>(&s_vec, &y_vec)
+                .or_else(|| $compute(&s_vec, &y_vec))
+            {
                 Some(p) => p,
                 None    => return false,
             };

@@ -421,6 +421,135 @@ pub fn soc_nt_w_and_inverse<const D: usize>(
     Some((y_mat, z_mat))
 }
 
+/// **Exact** closed-form Nesterov-Todd scaling for the second-order cone, via
+/// unit-determinant **normalized points** (the form production SOC solvers
+/// — ECOS, Clarabel, MOSEK — use). Returns the symmetric PD pair `(W, W⁻¹)`
+/// with the defining NT property
+/// ```text
+///   W·s = W⁻¹·y  =: λ     (the common scaling point)
+///   ⇔  W²·s = y           (so `M = W²` in `H = Gᵀ·W²·G` satisfies `M·s = y`)
+/// ```
+/// holding **exactly** (not the operator-geometric-mean approximation of
+/// [`soc_w_squared`] / [`soc_nt_w_and_inverse`], which is only exact for
+/// aligned bars `s̄ ∥ ȳ`).
+///
+/// **Why this is the fix for vanishing cones.** The geometric-mean form builds
+/// `arrow(s)^{−1/2}`, whose smallest eigenvalue is `1/√(s₀−‖s̄‖)` — it
+/// **overflows** as the cone approaches its boundary (`s₀ → ‖s̄‖`, i.e.
+/// `det(s) → 0`), which is exactly what the SCvx virtual-control relaxation
+/// produces at the optimum (`ν → 0`). The normalized-point form instead works
+/// with `s̄ = s/√det(s)` and `ȳ = y/√det(y)` (unit determinant) and the scalar
+/// `η = (det y/det s)^{1/4}`: as both cones vanish the per-point blowups
+/// **cancel** (the scaling point `w̄` has unit det and stays bounded; `η` is a
+/// determinant *ratio*), so `W` stays finite down to `det ~ 1e-300`. This is
+/// the numerical mechanism by which production solvers keep NT stable on cones
+/// that touch their boundary at the solution.
+///
+/// Construction (Vandenberghe, "The CVXOPT cone program solvers", §5.1):
+/// ```text
+///   s̄ = s/√det(s),  ȳ = y/√det(y)                  (unit determinant)
+///   γ = √((1 + s̄ᵀȳ)/2)                              (≥ 1, Euclidean dot)
+///   w̄ = (J·s̄ + ȳ)/(2γ),   J = diag(1,−1,…,−1)       (det(w̄)=1; verified)
+///   W = η·W̄,  η = (det y/det s)^{1/4}
+///   W̄ = [[ w̄₀,  w̄_bᵀ ], [ w̄_b,  I + w̄_b·w̄_bᵀ/(1+w̄₀) ]]   (spin automorphism)
+///   W̄⁻¹ = J·W̄·J  (same block form built from (w̄₀, −w̄_b))
+/// ```
+///
+/// Generic over const `D` — needs only `soc_det`, `sqrt`, dot products and
+/// `D×D` matrix arithmetic, so (unlike the eigendecomp / determinant-scaled
+/// Denman-Beavers paths) it works for any cone dimension with no per-`D`
+/// specialization.
+///
+/// Returns `None` if `s` or `y` is non-interior (`det ≤ 0`) or any intermediate
+/// is non-finite.
+pub fn soc_nt_scaling_exact<const D: usize>(
+    s: &SVector<f64, D>,
+    y: &SVector<f64, D>,
+) -> Option<(SMatrix<f64, D, D>, SMatrix<f64, D, D>)> {
+    // det(z) = z₀² − ‖z̄‖²  (strictly positive in the interior).
+    let mut sb = 0.0;
+    let mut yb = 0.0;
+    for i in 1..D {
+        sb += s[i] * s[i];
+        yb += y[i] * y[i];
+    }
+    let ds = s[0] * s[0] - sb;
+    let dy = y[0] * y[0] - yb;
+    // Reject non-interior (`det ≤ 0`) or non-finite. `!is_finite()` catches NaN
+    // (which `det ≤ 0` alone would miss, since `NaN ≤ 0` is false).
+    if !ds.is_finite() || ds <= 0.0 || !dy.is_finite() || dy <= 0.0 {
+        return None;
+    }
+    let rds = sqrt(ds);
+    let rdy = sqrt(dy);
+
+    // dot = s̄ᵀȳ = (sᵀy)/(√det s · √det y)  (Euclidean inner product).
+    let mut sy = 0.0;
+    for i in 0..D {
+        sy += s[i] * y[i];
+    }
+    let dot = sy / (rds * rdy);
+    let g2 = (1.0 + dot) * 0.5;
+    if !g2.is_finite() || g2 <= 0.0 {
+        return None;
+    }
+    let gamma = sqrt(g2);
+    let inv_2g = 1.0 / (2.0 * gamma);
+
+    // w̄ = (J·s̄ + ȳ)/(2γ): head adds, bar is ȳ_bar − s̄_bar (J negates the bar
+    // of s̄). This orientation is the one consistent with η = (det y/det s)^{1/4}
+    // and W²·s = y (verified against the geometric-mean form on aligned bars).
+    let mut w = SVector::<f64, D>::zeros();
+    w[0] = (s[0] / rds + y[0] / rdy) * inv_2g;
+    for i in 1..D {
+        w[i] = (y[i] / rdy - s[i] / rds) * inv_2g;
+    }
+    let w0 = w[0];
+    let denom = 1.0 + w0;
+    if !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+    let inv_denom = 1.0 / denom;
+
+    // η = (det y/det s)^{1/4}  (so that W²·s = y; verified for D=1: W²=y₀/s₀).
+    let eta = libm::pow(dy / ds, 0.25);
+    if !eta.is_finite() || eta <= 0.0 {
+        return None;
+    }
+    let inv_eta = 1.0 / eta;
+
+    // W = η·W̄, W⁻¹ = (1/η)·(W̄ with the bar of w̄ negated). The bar–bar block
+    // `I + w̄_b·w̄_bᵀ/(1+w̄₀)` is identical for both (sign cancels); only the
+    // head↔bar cross terms flip sign.
+    let mut wmat = SMatrix::<f64, D, D>::zeros();
+    let mut winv = SMatrix::<f64, D, D>::zeros();
+    wmat[(0, 0)] = eta * w0;
+    winv[(0, 0)] = inv_eta * w0;
+    for i in 1..D {
+        wmat[(0, i)] = eta * w[i];
+        wmat[(i, 0)] = eta * w[i];
+        winv[(0, i)] = inv_eta * (-w[i]);
+        winv[(i, 0)] = inv_eta * (-w[i]);
+    }
+    for i in 1..D {
+        for j in 1..D {
+            let val = (if i == j { 1.0 } else { 0.0 }) + w[i] * w[j] * inv_denom;
+            wmat[(i, j)] = eta * val;
+            winv[(i, j)] = inv_eta * val;
+        }
+    }
+    // Defensive finiteness gate (the cancellation keeps these bounded, but a
+    // pathological near-underflow `det` could still slip through).
+    for i in 0..D {
+        for j in 0..D {
+            if !wmat[(i, j)].is_finite() || !winv[(i, j)].is_finite() {
+                return None;
+            }
+        }
+    }
+    Some((wmat, winv))
+}
+
 // ===========================================================================
 // Unit tests
 // ===========================================================================
@@ -839,5 +968,127 @@ mod tests {
         let dz = [0.0, 1.0, 0.0];
         let a  = soc_max_step(&z, &dz);
         assert!((a - 2.0).abs() < 1e-12, "got α = {}", a);
+    }
+
+    /// Exact NT scaling must satisfy `W²·s = y` (the defining property) and
+    /// `W·s = W⁻¹·y` to machine precision, at every SCvx cone dim, plus the
+    /// basics (`W·W⁻¹ = I`, symmetry, finiteness).
+    #[test]
+    fn exact_nt_scaling_satisfies_w_squared_s_equals_y() {
+        use nalgebra::SVector;
+        fn check<const D: usize>(s_arr: &[f64], y_arr: &[f64], tol: f64, tag: &str) {
+            let s = SVector::<f64, D>::from_column_slice(s_arr);
+            let y = SVector::<f64, D>::from_column_slice(y_arr);
+            let (w, w_inv) = soc_nt_scaling_exact::<D>(&s, &y)
+                .unwrap_or_else(|| panic!("{tag}: exact NT returned None"));
+            let w2s = w * (w * s);            // W²·s
+            let ws  = w * s;                  // scaling point λ = W·s
+            let wiy = w_inv * y;              // = W⁻¹·y, must equal λ
+            for i in 0..D {
+                assert!((w2s[i] - y[i]).abs() < tol,
+                    "{tag}: (W²s−y)[{i}] = {:.3e}", (w2s[i] - y[i]).abs());
+                assert!((ws[i] - wiy[i]).abs() < tol,
+                    "{tag}: (Ws−W⁻¹y)[{i}] = {:.3e}", (ws[i] - wiy[i]).abs());
+            }
+            let prod = w * w_inv;
+            for i in 0..D {
+                for j in 0..D {
+                    let e = if i == j { 1.0 } else { 0.0 };
+                    assert!((prod[(i, j)] - e).abs() < 1e-9, "{tag}: W·W⁻¹ off ({i},{j})");
+                    assert!((w[(i, j)] - w[(j, i)]).abs() < 1e-12, "{tag}: W asymmetric");
+                    assert!(w[(i, j)].is_finite() && w_inv[(i, j)].is_finite(), "{tag}: non-finite");
+                }
+            }
+        }
+        check::<1>(&[3.0], &[2.0], 1e-12, "D1");
+        check::<3>(&[5.0, 1.0, -2.0], &[3.0, 0.5, 1.0], 1e-10, "D3");
+        check::<4>(&[10.0, 1.0, -2.0, 3.0], &[2.0, 0.5, 0.3, -0.4], 1e-10, "D4");
+        check::<8>(
+            &[5.0, 0.5, -0.3, 0.1, -0.2, 0.4, 0.0, 0.1],
+            &[3.0, 0.1, 0.2, -0.1, 0.3, -0.2, 0.4, 0.0],
+            1e-10, "D8",
+        );
+        check::<11>(
+            &[200.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.2, 0.1, 0.0, 50.0],
+            &[150.0, 0.5, 0.0, 0.8, 0.0, 0.0, 1.5, 0.1, 0.0, 0.0, 30.0],
+            1e-9, "D11",
+        );
+    }
+
+    /// THE vanishing-cone fix: `s` and `y` both ride onto the cone boundary
+    /// (`det → 0`), as the SCvx virtual-control relaxation produces at the
+    /// optimum. The exact NT scaling stays **finite** and `W²s = y` holds; the
+    /// geometric-mean form's `arrow(s)^{−1/2}` (eigenvalue `1/√(s₀−‖s̄‖)`)
+    /// would blow up to `~1/eps` here.
+    #[test]
+    fn exact_nt_scaling_stable_on_vanishing_cone() {
+        extern crate std;
+        use nalgebra::SVector;
+        fn near_boundary<const D: usize>(bar: &[f64], eps: f64) -> SVector<f64, D> {
+            let mut v = SVector::<f64, D>::zeros();
+            let mut nb = 0.0;
+            for i in 1..D {
+                v[i] = bar[i - 1];
+                nb += bar[i - 1] * bar[i - 1];
+            }
+            v[0] = nb.sqrt() + eps; // det = v₀² − ‖bar‖² ≈ 2‖bar‖·eps → 0
+            v
+        }
+        let sbar = [0.30, -0.20, 0.50, 0.10, -0.40, 0.20, 0.10];
+        let ybar = [0.31, -0.19, 0.52, 0.08, -0.41, 0.18, 0.12]; // ~complementary
+        for &eps in &[1e-3, 1e-5, 1e-7, 1e-9] {
+            let s = near_boundary::<8>(&sbar, eps);
+            let y = near_boundary::<8>(&ybar, eps);
+            let (w, _wi) = soc_nt_scaling_exact::<8>(&s, &y)
+                .unwrap_or_else(|| panic!("eps={eps:.0e}: exact NT None on vanishing cone"));
+            let w2s = w * (w * s);
+            let mut maxerr = 0.0_f64;
+            let mut maxw = 0.0_f64;
+            for i in 0..8 {
+                maxerr = maxerr.max((w2s[i] - y[i]).abs());
+                assert!(w2s[i].is_finite(), "eps={eps:.0e}: W²s non-finite");
+                for j in 0..8 {
+                    maxw = maxw.max(w[(i, j)].abs());
+                }
+            }
+            std::eprintln!("vanishing eps={eps:.0e}: max|W²s−y|={maxerr:.2e} max|W|={maxw:.2e}");
+            assert!(maxerr < 1e-4, "eps={eps:.0e}: W²s−y = {maxerr:.2e} (blew up?)");
+            assert!(maxw.is_finite() && maxw < 1e6, "eps={eps:.0e}: W blew up ({maxw:.2e})");
+        }
+    }
+
+    /// The exact NT scaling (boost form) and the geometric-mean approximation
+    /// both satisfy `W²·s = y` and AGREE on the subspace where `s, y` have
+    /// support. They differ only in the transverse/null directions — there the
+    /// boost form uses the canonical scalar `η² = √(det y/det s)` (it is a true
+    /// cone automorphism) while the arrow-based geomean does not — but that
+    /// difference cannot affect `W²·s`. Verify the shared, meaningful behaviour.
+    #[test]
+    fn exact_nt_and_geomean_agree_on_supported_action() {
+        use nalgebra::SVector;
+        let s = SVector::<f64, 4>::from_column_slice(&[5.0, 2.0, 0.0, 0.0]);
+        let y = SVector::<f64, 4>::from_column_slice(&[3.0, 1.0, 0.0, 0.0]);
+        let (w_exact, _) = soc_nt_scaling_exact::<4>(&s, &y).unwrap();
+        let w2_exact = w_exact * w_exact;
+        let w2_geo = soc_w_squared::<4>(&s, &y).unwrap();
+        // Both map s → y.
+        for (m, tag) in [(w2_exact, "exact"), (w2_geo, "geo")] {
+            let ms = m * s;
+            for i in 0..4 {
+                assert!((ms[i] - y[i]).abs() < 1e-9, "{tag}: (W²s−y)[{i}] != 0");
+            }
+        }
+        // They agree on the action on any vector supported in span{e0, e1}
+        // (zero transverse component) — check on s and y themselves.
+        for v in [s, y] {
+            let a = w2_exact * v;
+            let b = w2_geo * v;
+            for i in 0..4 {
+                assert!(
+                    (a[i] - b[i]).abs() < 1e-9,
+                    "exact vs geo differ on supported action at {i}: {} vs {}", a[i], b[i]
+                );
+            }
+        }
     }
 }
