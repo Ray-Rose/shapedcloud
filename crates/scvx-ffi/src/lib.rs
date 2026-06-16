@@ -419,8 +419,11 @@ macro_rules! emit_ffi_per_n {
                 || !phys_rs.cd_a.is_finite() || phys_rs.cd_a < 0.0
                 // Cone-shape params feed the pointing / glide-slope cone rows in
                 // `assemble_scvx_socp`; non-finite poisons the SOCP `G`/`h`.
-                // `cos θ_max` is a real cosine (> 0); `tan γ_gs ≥ 0`.
-                || !phys_rs.cos_theta_max.is_finite() || phys_rs.cos_theta_max <= 0.0
+                // `cos θ_max ∈ [0, 1]` (real cosine of the pointing half-angle:
+                // `0` ⇒ 90° ⇒ `u_z ≥ 0`, a valid degenerate config; `> 1` has no
+                // real angle); `tan γ_gs ≥ 0`.
+                || !phys_rs.cos_theta_max.is_finite()
+                || phys_rs.cos_theta_max < 0.0 || phys_rs.cos_theta_max > 1.0
                 || !phys_rs.tan_gamma_gs.is_finite()  || phys_rs.tan_gamma_gs  < 0.0
                 || !options_rs.initial_tau.is_finite() || options_rs.initial_tau <= 0.0
                 // target_mass MUST be in [m_dry, m_wet]. Outside this band,

@@ -436,14 +436,18 @@ pub fn soc_nt_w_and_inverse<const D: usize>(
 /// **Why this is the fix for vanishing cones.** The geometric-mean form builds
 /// `arrow(s)^{−1/2}`, whose smallest eigenvalue is `1/√(s₀−‖s̄‖)` — it
 /// **overflows** as the cone approaches its boundary (`s₀ → ‖s̄‖`, i.e.
-/// `det(s) → 0`), which is exactly what the SCvx virtual-control relaxation
-/// produces at the optimum (`ν → 0`). The normalized-point form instead works
-/// with `s̄ = s/√det(s)` and `ȳ = y/√det(y)` (unit determinant) and the scalar
-/// `η = (det y/det s)^{1/4}`: as both cones vanish the per-point blowups
-/// **cancel** (the scaling point `w̄` has unit det and stays bounded; `η` is a
-/// determinant *ratio*), so `W` stays finite down to `det ~ 1e-300`. This is
-/// the numerical mechanism by which production solvers keep NT stable on cones
-/// that touch their boundary at the solution.
+/// `det(s) → 0`) REGARDLESS of `y`, which is exactly what the SCvx virtual-
+/// control relaxation produces at the optimum (`ν → 0`). The normalized-point
+/// form works with `s̄ = s/√det(s)`, `ȳ = y/√det(y)` and `η = (det y/det s)^{1/4}`
+/// (a determinant *ratio* — it stays O(1) when both determinants vanish
+/// together). The scaling point `w̄ = (J·s̄ + ȳ)/(2γ)` stays bounded **on the
+/// central path**: the centering condition `s ∘ y ≈ μe` keeps `s̄ ≈ ȳ` per cone,
+/// so `w̄ ≈ e` (the identity) and `W ≈ η·I` even as both determinants → 0.
+/// (Unit determinant alone does NOT bound `w̄`: for ANTI-aligned `s̄`, `ȳ`
+/// riding the boundary in opposite bar directions, `w̄₀ ~ 1/√det` still grows —
+/// but real IPM iterates are near-complementary, so that regime does not
+/// arise.) That is the numerical mechanism by which production solvers keep NT
+/// stable on the cones that touch their boundary at the solution.
 ///
 /// Construction (Vandenberghe, "The CVXOPT cone program solvers", §5.1):
 /// ```text
@@ -489,6 +493,9 @@ pub fn soc_nt_scaling_exact<const D: usize>(
         sy += s[i] * y[i];
     }
     let dot = sy / (rds * rdy);
+    // `g2 ≥ 1` (and, below, `denom = 1+w̄₀ ≥ 2`) in exact arithmetic for interior
+    // points, so the `≤ 0` arms are unreachable there — they exist only so the
+    // `!is_finite()` companion catches a NaN that slipped through `dot`.
     let g2 = (1.0 + dot) * 0.5;
     if !g2.is_finite() || g2 <= 0.0 {
         return None;
@@ -1015,13 +1022,20 @@ mod tests {
         );
     }
 
-    /// THE vanishing-cone fix: `s` and `y` both ride onto the cone boundary
-    /// (`det → 0`), as the SCvx virtual-control relaxation produces at the
-    /// optimum. The exact NT scaling stays **finite** and `W²s = y` holds; the
-    /// geometric-mean form's `arrow(s)^{−1/2}` (eigenvalue `1/√(s₀−‖s̄‖)`)
-    /// would blow up to `~1/eps` here.
+    /// THE vanishing-cone fix, scoped honestly. As a cone vanishes (`det → 0`,
+    /// the SCvx virtual-control relaxation at the optimum), the EXACT NT scaling
+    /// stays bounded **on the central path** — where the centering condition
+    /// `s ∘ y ≈ μe` keeps `s̄ ≈ ȳ` per cone, so `w̄ ≈ e` and `W ≈ η·I`. The
+    /// geometric-mean form's `arrow(s)^{−1/2}` (eigenvalue `1/√(s₀−‖s̄‖)`) would
+    /// blow up to `~1/eps` here REGARDLESS of `y`.
+    ///
+    /// HONEST SCOPE: the exact form is bounded because of near-complementarity,
+    /// NOT because of unit determinant. For ANTI-aligned `s̄`, `ȳ` (opposite bar
+    /// directions — a pairing real IPM iterates never produce, since
+    /// complementarity forbids it) `W` stays finite (no NaN) but GROWS like
+    /// `~1/√det`. Both regimes are asserted.
     #[test]
-    fn exact_nt_scaling_stable_on_vanishing_cone() {
+    fn exact_nt_scaling_bounded_on_central_path_vanishing_cone() {
         extern crate std;
         use nalgebra::SVector;
         fn near_boundary<const D: usize>(bar: &[f64], eps: f64) -> SVector<f64, D> {
@@ -1035,25 +1049,52 @@ mod tests {
             v
         }
         let sbar = [0.30, -0.20, 0.50, 0.10, -0.40, 0.20, 0.10];
-        let ybar = [0.31, -0.19, 0.52, 0.08, -0.41, 0.18, 0.12]; // ~complementary
+        let ybar = [0.31, -0.19, 0.52, 0.08, -0.41, 0.18, 0.12]; // near-complementary
+
+        // (a) CENTRAL PATH (s̄ ≈ ȳ): W bounded ~η, W²s = y tight, at every eps.
         for &eps in &[1e-3, 1e-5, 1e-7, 1e-9] {
             let s = near_boundary::<8>(&sbar, eps);
             let y = near_boundary::<8>(&ybar, eps);
             let (w, _wi) = soc_nt_scaling_exact::<8>(&s, &y)
-                .unwrap_or_else(|| panic!("eps={eps:.0e}: exact NT None on vanishing cone"));
+                .unwrap_or_else(|| panic!("central eps={eps:.0e}: exact NT None"));
             let w2s = w * (w * s);
             let mut maxerr = 0.0_f64;
             let mut maxw = 0.0_f64;
             for i in 0..8 {
                 maxerr = maxerr.max((w2s[i] - y[i]).abs());
-                assert!(w2s[i].is_finite(), "eps={eps:.0e}: W²s non-finite");
+                assert!(w2s[i].is_finite(), "central eps={eps:.0e}: W²s non-finite");
                 for j in 0..8 {
                     maxw = maxw.max(w[(i, j)].abs());
                 }
             }
-            std::eprintln!("vanishing eps={eps:.0e}: max|W²s−y|={maxerr:.2e} max|W|={maxw:.2e}");
-            assert!(maxerr < 1e-4, "eps={eps:.0e}: W²s−y = {maxerr:.2e} (blew up?)");
-            assert!(maxw.is_finite() && maxw < 1e6, "eps={eps:.0e}: W blew up ({maxw:.2e})");
+            std::eprintln!("central eps={eps:.0e}: max|W²s−y|={maxerr:.2e} max|W|={maxw:.2e}");
+            assert!(maxerr < 1e-4, "central eps={eps:.0e}: W²s−y = {maxerr:.2e} (blew up?)");
+            assert!(maxw.is_finite() && maxw < 10.0, "central eps={eps:.0e}: W not ~η ({maxw:.2e})");
+        }
+
+        // (b) ANTI-ALIGNED (ȳ bar = −s̄ bar): W stays FINITE (the finiteness gate
+        // holds — no NaN) but GROWS as det → 0, confirming the bound is
+        // central-path-dependent, not universal. Not produced by a real IPM.
+        let mut prev = 0.0_f64;
+        for &eps in &[1e-3, 1e-5, 1e-7] {
+            let s = near_boundary::<8>(&sbar, eps);
+            let mut yneg = sbar;
+            for v in yneg.iter_mut() {
+                *v = -*v;
+            }
+            let y = near_boundary::<8>(&yneg, eps);
+            let (w, _wi) = soc_nt_scaling_exact::<8>(&s, &y)
+                .unwrap_or_else(|| panic!("anti eps={eps:.0e}: exact NT None"));
+            let mut maxw = 0.0_f64;
+            for i in 0..8 {
+                for j in 0..8 {
+                    assert!(w[(i, j)].is_finite(), "anti eps={eps:.0e}: W non-finite");
+                    maxw = maxw.max(w[(i, j)].abs());
+                }
+            }
+            std::eprintln!("anti-aligned eps={eps:.0e}: max|W|={maxw:.2e} (grows ~1/√det)");
+            assert!(maxw > prev, "anti eps={eps:.0e}: |W| should grow as det→0");
+            prev = maxw;
         }
     }
 

@@ -288,7 +288,11 @@ pub fn solve_scvx<
     if !phys.m_dry.is_finite() || phys.m_dry <= 0.0
         || !phys.rho.is_finite()  || phys.rho  < 0.0
         || !phys.cd_a.is_finite() || phys.cd_a < 0.0
-        || !phys.cos_theta_max.is_finite() || phys.cos_theta_max <= 0.0
+        // `cos θ_max ∈ [0, 1]` (real cosine of the pointing half-angle: `0` ⇒
+        // 90° ⇒ `u_z ≥ 0`, a valid degenerate config; `> 1` has no real angle);
+        // `tan γ_gs ≥ 0`.
+        || !phys.cos_theta_max.is_finite()
+        || phys.cos_theta_max < 0.0 || phys.cos_theta_max > 1.0
         || !phys.tan_gamma_gs.is_finite()  || phys.tan_gamma_gs  < 0.0
     {
         return SolverStatus::BadInput;

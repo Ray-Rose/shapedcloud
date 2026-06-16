@@ -13,7 +13,7 @@ a context-window roll-over so the next session starts coherent.
   free-final-time. Static-memory, no-`std`, no-`alloc`, no-`panic`,
   bounded-WCET — "research-grade flight-shaped" per the original plan.
 - **Where**: the repository workspace root (all paths below are repo-relative)
-- **State**: **125 tests pass** across **5 crates**,
+- **State**: **132 tests pass** across **5 crates**,
   `cargo clippy --all-targets -- -D warnings` clean,
   `cargo build --release --target thumbv7em-none-eabihf -p scvx-solver`
   clean (the no_std flight crates cross-compile to ARM Cortex-M), and the
@@ -924,10 +924,14 @@ which is the genuine forward work (see below).**
 
 ### Honest forward path (ranked)
 
-1. **NT flight-scale convergence** (open item #1) — the deepest open problem;
-   an IPM-theory effort (neighborhood/centering or per-cone scaling), not a
-   numerics tweak (corrector + IR already tried; IR reverted as a measured
-   dead-end). AHO is the production default and works.
+1. **NT flight-scale convergence** (open item #1) — the deepest open problem.
+   **Phase 22 narrowed it decisively**: the exact closed-form SOC NT scaling
+   (`soc_nt_scaling_exact`, vanishing-cone-stable, landed) does NOT fix it, so
+   **per-cone scaling is now exhausted as a lever** (corrector + IR + Higham-DB
+   + exact-scaling all tried). The remaining barrier is the **global NT Newton
+   direction / centering** on the imbalanced vanishing-cone structure — a
+   wide-neighborhood / per-cone-balanced centering scheme, genuine IPM research.
+   AHO is the production default and works.
 2. **Larger-N as the default path** — the tuned trust thresholds
    (`rho_shrink=0.05, rho_grow=0.1`) make N≥8 converge to ‖ν‖~1e-10 but
    destabilize small-N, so they're explicit per-mission tuning today. A
@@ -935,9 +939,11 @@ which is the genuine forward work (see below).**
    ρ) would make one default work across scales.
 3. **Structured-path end-to-end win** (open item #2) — blocked by the same
    AHO-endgame fallback erosion; tied to #1. Until then dense is the default.
-4. **Coverage hardening** — promote more convergence ‖ν‖ assertions into CI;
-   add an external-oracle test for the SCvx outer loop / free-tf / NT (today
-   only the dense-AHO toy SOCP has an oracle).
+4. **Coverage hardening** — **mostly DONE (Phase 21)**: an external-oracle test
+   now validates AHO (fixed-tf + free-tf) against CVXPY/Clarabel + Julia/Clarabel
+   on the real 57/58-var assembled SCvx subproblem (not just the toy SOCP).
+   Remaining: an NT external-oracle gate is blocked until NT converges on the
+   flight subproblem (item #1); promote more outer-loop ‖ν‖ assertions into CI.
 5. **Optional cleanups** — delete or clearly quarantine the vestigial
    test-only paths (`kkt.rs` Riccati, diagonal-M reduced-KKT, `assemble_lcvx_socp`,
    empty `trust.rs`) to shrink the audit surface; make `RB_MAX` a const generic
@@ -1231,10 +1237,156 @@ is a build-time constant.
 
 ---
 
+## Phase 20 — consolidation: audit-driven hardening (LANDED)
+
+A from-scratch **5-agent line-by-line audit** of all 24 source files (one agent
+per crate group, each re-deriving the math by hand). **Verdict: clean on
+correctness** — the IPM / cone / NT / Jacobian / FOH-RK4-discretization formulas
+were re-derived AND numerically re-verified to machine precision, and every
+flight invariant holds. The audit surfaced only minor hardening items, all fixed
+here. **Behavior-preserving**: the `mars_descent` example is byte-identical
+(`cost=4.3699e3, τ=14.029s`); the validation additions only reject bad input.
+
+- **Input validation gaps closed.** The FFI boundary and `solve_scvx` now reject
+  non-finite / negative `rho`, `cd_a` (they feed the drag dynamics — a bad value
+  poisoned `v̇`/the STM silently) and non-finite / non-positive `cos_theta_max`,
+  `tan_gamma_gs` (the pointing / glide-slope cone rows). `solve_scvx` also rejects
+  `m_dry ≤ 0`/non-finite (feeds `log(m_dry)` in the mass-floor cone) and a
+  non-finite / non-positive `reference.tau` in BOTH fixed- and free-tf modes
+  (fixed-tf previously had no τ guard — a NaN `initial_tau` flowed into the
+  discretizer).
+- **Dead config removed (false-claim cleanup in a flight crate).**
+  `IpmAlgoParams::regularization` was never read → **wired** into the dense IPM's
+  adaptive-reg term (default `1e-10` preserved ⇒ zero behavior change, with a
+  non-finite/negative fallback). `IpmAlgoParams::cond_bail` (documented an
+  IPM-level dense fallback on condition number that does not exist and does not
+  fit the architecture) → **removed**. The unused `BoundaryCondition` type (latent
+  `ln(0)` footgun if wired) → **removed**.
+- **Doc-truth + hygiene.** `precondition.rs`: the trust-cone scale table said
+  `max(trust_eta, pos, thrust)` but the code (correctly) uses `trust_eta`;
+  `build_scaling_diagonal`'s u/σ reasoning conflated conditioning with
+  feasibility — both corrected. `INTEGRATION.md` stale section-ref fixed.
+  `assemble_scvx_socp` got `debug_assert!(N >= 1)`. `oracle_diff.rs`'s dead
+  `cost_idx` block became a **real assertion** — `cᵀx` (the objective the solver
+  minimized) is now checked against the oracle optimal cost at all 6 call sites.
+
+---
+
+## Phase 21 — external-oracle coverage for a flight-scale subproblem (LANDED)
+
+Closes forward-path item #4. `oracle_diff.rs` only validated the IPM on three
+**toy** SOCPs (≤ 4 vars, 1–2 cones). The new
+`crates/scvx-solver/tests/oracle_scvx_subproblem.rs` extends external-oracle
+coverage to a **real assembled SCvx subproblem** — the 19·N-var, 8·N-cone problem
+the production outer loop hands the inner IPM, with all eight cone types, both
+fixed-tf (57 vars) and free-tf (58 vars, with the global δτ column).
+
+- **Transcription-free approach.** The test assembles a faithful iter-0
+  subproblem (replicating `seed_linear_reference` + `discretize_foh` +
+  `assemble_scvx_socp` + preconditioning) for a deterministic 100 m Mars
+  descent, and (via an `#[ignore]`d `dump_oracle_fixtures` test) writes the
+  standard-form matrices `(c, A, b, G, h, cones)` to `tools/oracle-data/`. The
+  Python (CVXPY) and Julia (JuMP) oracle scripts re-solve that **exact generic
+  SOCP** with Clarabel — no physics re-encoding, so there is zero Python/Rust
+  modelling drift (the oracle validates the IPM's *solve* of the assembled
+  matrices, taking the separately-unit-tested assembly as given).
+- **Result.** CVXPY/Clarabel and Julia/Clarabel agree to **~1e-9** on the
+  optimum (fixed-tf `2.176946359299e6` both; free-tf agree to 1e-9). The Rust AHO
+  IPM matches the optimal **cost** to **5.3e-4** (fixed-tf) / **7.6e-3** (free-tf)
+  with tight primal feasibility (`|Ax−b|`, `|Gx+s−h|` ~1e-11). It nails the
+  primal objective; only the dual/complementarity rides the documented AHO
+  endgame loose. The assertions therefore check optimal-cost agreement + primal
+  feasibility (cost is invariant under the column + cone-row preconditioning, so
+  it is directly comparable) and **report**, not assert, the duality gap — an
+  honest framing of what AHO achieves.
+- Also fixed a pre-existing oversight: `tools/py-oracle/.gitignore` was `*`,
+  which ignored even `solve_canonical.py` (the root `.gitignore` intends to keep
+  it). Now whitelisted, so both Python oracle scripts are tracked source.
+- **127 → 129 tests** (+2 oracle subproblem tests; the dump is `#[ignore]`d).
+
+---
+
+## Phase 22 — exact closed-form SOC NT scaling + frontier measurement (LANDED)
+
+Tackles the **NT / O(N) frontier** (forward item #1). Implements the canonical
+Nesterov-Todd scaling for the second-order cone via unit-determinant **normalized
+points** (the form ECOS / Clarabel / MOSEK use), in
+`scvx_ipm::cone::soc_nt_scaling_exact`, replacing the operator-geometric-mean
+`W² = arrow(s)⁻¹ᐟ²·arrow(y)·arrow(s)⁻¹ᐟ²` as the **primary** NT scaling (geomean
+kept as `.or_else` fallback in `build_nt_block_for_cone`).
+
+- **What landed (verified correct).** Generic over const `D` (only `soc_det` /
+  `sqrt` / dot / `D×D` arithmetic — no eigendecomp or determinant trait, so **no
+  per-`D` macro**), returning the symmetric PD pair `(W, W⁻¹)` with `W·s = W⁻¹·y`,
+  i.e. `W²·s = y` **EXACTLY** (the geomean is exact only for aligned bars). Three
+  new tests: `W²s=y` to machine precision at every SCvx cone dim; **vanishing-cone
+  stability** — at `det ~ 1e-9` it stays bounded (`max|W|~1`, `max|W²s−y|~1e-16`)
+  where the geomean's `arrow(s)⁻¹ᐟ²` (eigenvalue `1/√(s₀−‖s̄‖)`) overflows to
+  ~`1e9`; and supported-action agreement with the geomean. The boundary blowups
+  cancel because `w̄` has unit det and `η=(det y/det s)^{1/4}` is a ratio. This is
+  the "SDPT3-level per-cone handling of vanishing cones" the frontier called for.
+
+- **HONEST MEASUREMENT (the result).** The exact scaling is **necessary but not
+  sufficient**. It eliminates the per-cone overflow failure mode, but NT **still
+  diverges** on the flight subproblem at every altitude (2/10/50/100 m,
+  `diag_nt_on_flight_subproblem`): primal infeasibility `|Ax−b|` *grows* to ~9–29
+  and the duality gap explodes (`s·y/n ~ 1e12–1e14`), while AHO reaches
+  BestFeasible. This **independently confirms and refines the Phase-15 finding**:
+  the barrier is NOT the per-cone scaling (the exact canonical scaling does not
+  help) — it is the **global NT Newton direction / centering** on the imbalanced
+  vanishing-cone structure (virtual-control SOC⁸ carry `μ_cone ~ 1e-4` vs
+  thrust/trust ~`1e7`, so `H = GᵀW²G` is catastrophically ill-conditioned; AHO's
+  asymmetric arrow scaling tolerates this, NT's symmetric `W²` does not). **A real
+  fix needs a wide-neighborhood / per-cone-balanced centering scheme — IPM
+  research, not a better scaling.** Per-cone scaling is now exhausted as a lever.
+
+- **Net.** A verified, zero-regression correctness upgrade to the opt-in NT path
+  (the geomean was a documented approximation; this is the true NT scaling and
+  removes an overflow-to-NaN failure mode — it only touches the NT path, AHO/
+  production untouched), plus a clean negative result. AHO stays the production
+  default; NT stays opt-in with graceful fallback.
+
+---
+
+## Phase 23 — post-implementation adversarial review (LANDED)
+
+Two independent review agents re-derived the new NT scaling math from scratch
+(in Python, NOT trusting the code's own tests) and adversarially stress-tested
+the new validation + oracle infrastructure. **Verdict: no correctness or safety
+bugs.** Independently confirmed: `W²s=y` exact (machine precision on aligned AND
+misaligned bars), `W⁻¹` correct, genuine SOC automorphism (0/100000 random points
+mapped outside the cone), all overflow/underflow paths gated, AHO numerically
+untouched, the NT corrector now MORE exact (`s̃=ỹ` is now machine-exact, was
+approximate). On the infra side: the dump↔Python/Julia-parser round-trip is
+byte-identical, the `regularization` wiring is default-preserving (proven by the
+byte-identical `mars_descent`), validation rejects only bad input, and cone-row
+scaling provably preserves cost.
+
+Fixes applied (all honesty / completeness — no behavior change on valid input):
+- **Boundedness mechanism corrected (the substantive finding).** The
+  `soc_nt_scaling_exact` docstring claimed `W` stays bounded "because `w̄` has
+  unit det" — a **non-sequitur** (unit det does NOT imply bounded). The real
+  reason is **central-path near-complementarity** (`s∘y≈μe` ⇒ `s̄≈ȳ` ⇒ `w̄≈e`);
+  for ANTI-aligned `s̄,ȳ` riding the boundary, `W` grows `~1/√det` even with the
+  exact scaling. The docstring + this HANDOFF now state this correctly, and the
+  vanishing-cone test was rewritten to assert BOTH regimes: central-path
+  (`max|W|≈1.01`, `W²s−y~1e-16` down to `det~1e-9`) AND anti-aligned (`max|W|`
+  grows `19.7→197→1968`, finite but unbounded). Refines, does not change, the
+  Phase-22 conclusion.
+- **Validation completeness.** `cos_theta_max` is now bounded to `[0, 1]` (a
+  cosine `> 1` has no real angle; `= 0` ⇒ 90° pointing is a valid degenerate
+  config), and a stale contradictory FFI comment was reconciled.
+
+---
+
 ## Final state summary
 
 ```
-Tests:      127 passing across 5 crates + 2 integration suites + 3 API + 8 FFI tests
+Tests:      132 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (127 → 129 → 132: Phase 21 added +2 external-oracle flight-subproblem
+                              tests — AHO vs CVXPY/Clarabel + Julia on the real
+                              57/58-var assembled SCvx SOCP; Phase 22 added +3
+                              scvx-ipm cone tests for the exact NT scaling)
               (Phase 10 v1 added: +1 FFI flag/entrypoint-mismatch regression
                                 + 1 FFI Isp/g0=0 rejection
                                 + 1 FFI N=8/N=10 expanded-surface smoke test;
