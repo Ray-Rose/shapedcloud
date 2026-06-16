@@ -131,8 +131,13 @@ pub struct IpmAlgoParams {
     pub tol_gap:          f64,
     pub refine_thresh:    f64,
     pub max_refine_iters: u32,
-    pub regularization:   f64, // α factor for H += α·tr(H)/n · I
-    pub cond_bail:        f64, // bail to dense fallback if cond(P_k) > this
+    /// Relative Tikhonov factor for the **adaptive** reduced-Hessian
+    /// regularization. When `use_adaptive_regularization` is set, the dense
+    /// IPM uses `reg = max(1e-8, regularization · tr(H)/n)`; when it is unset
+    /// (the default) the fixed `1e-8` floor is used and this field has no
+    /// effect. A non-finite or negative value falls back to the `1e-10`
+    /// default. Default `1e-10`.
+    pub regularization:   f64,
     /// If `true`, `solve_socp` does NOT reset `ws.x` and `ws.lambda` at
     /// entry — caller is responsible for pre-seeding them with a good
     /// initial point. Defaults to `false` (legacy behavior: cold start
@@ -186,7 +191,6 @@ impl Default for IpmAlgoParams {
             refine_thresh:    1.0e-10,
             max_refine_iters: 1,
             regularization:   1.0e-10,
-            cond_bail:        1.0e12,
             warm_start_x:                false,
             use_nt_scaling:              false,
             use_preconditioning:         false,

@@ -213,7 +213,7 @@ parameters.
 
 Validation scope (be precise here):
 - `initial_tau` and `target_mass` are validated at the FFI boundary (see the
-  table in §6's siblings above) → `BAD_INPUT`.
+  input-constraint table in §5.1) → `BAD_INPUT`.
 - The trust-region parameters are validated by the solver: `trust_eta*` and
   `virt_weight` must be finite, `trust_eta_min >= 0`, `trust_eta_max >=
   trust_eta_min`, and `virt_weight >= 0`, else `BAD_INPUT`. (Enforced inside

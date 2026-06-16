@@ -365,6 +365,9 @@ pub fn assemble_scvx_socp<
     }
     debug_assert_eq!(NE,     N * N_EQ_PER_DYN + N_EQ_TERMINAL,
                      "NE must equal 7·N + 6 (free-tf does not add equality rows)");
+    // `N = 0` is a nonsensical layout (NP = 0) that would underflow `(N - 1)`
+    // in the dynamics/terminal row math below; pin it for dev builds.
+    debug_assert!(N >= 1, "N (node count) must be >= 1");
     debug_assert!(trust_eta > 0.0, "trust radius must be positive");
     debug_assert!(virt_weight >= 0.0, "virtual-control weight must be non-negative");
     if use_free_tf {

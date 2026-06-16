@@ -238,6 +238,15 @@ pub fn solve_scvx<
         }
     }
 
+    // `reference.tau` (time-of-flight scale) feeds `discretize_foh` as τ in
+    // BOTH fixed- and free-tf modes; it must be finite and positive. The
+    // free-tf branch below additionally checks the `[tau_lo, tau_hi]` band, but
+    // fixed-tf had no τ guard — a NaN `initial_tau` flowed straight into the
+    // discretizer (and then the SOCP RHS via `c + s·τ`). Reject here.
+    if !workspace.reference.tau.is_finite() || workspace.reference.tau <= 0.0 {
+        return SolverStatus::BadInput;
+    }
+
     // Free-tf validation: in release mode the `debug_assert!`s inside
     // `assemble_scvx_socp` are no-ops, so we re-check here at runtime.
     // Reject pathological τ-bound inputs with `BadInput` rather than
@@ -265,6 +274,22 @@ pub fn solve_scvx<
     if !phys.isp.is_finite() || !phys.g0.is_finite()
         || phys.isp <= 0.0 || phys.g0 <= 0.0
         || !phys.g.iter().all(|c| c.is_finite())
+    {
+        return SolverStatus::BadInput;
+    }
+
+    // Mass, drag, and cone-shape params that feed the assembler / dynamics.
+    // `m_dry` is fed through `log(m_dry)` into the mass-floor cone `h`
+    // (`assemble.rs`); `≤ 0` or non-finite yields NaN/−∞ in the SOCP RHS.
+    // `rho`/`cd_a` feed `v̇` and the STM — non-finite poisons them and a
+    // negative value is unphysical anti-drag. `cos θ_max`/`tan γ_gs` feed the
+    // pointing / glide-slope cone rows. All are caught downstream as
+    // InnerFailure today; rejecting here gives the caller a precise `BadInput`.
+    if !phys.m_dry.is_finite() || phys.m_dry <= 0.0
+        || !phys.rho.is_finite()  || phys.rho  < 0.0
+        || !phys.cd_a.is_finite() || phys.cd_a < 0.0
+        || !phys.cos_theta_max.is_finite() || phys.cos_theta_max <= 0.0
+        || !phys.tan_gamma_gs.is_finite()  || phys.tan_gamma_gs  < 0.0
     {
         return SolverStatus::BadInput;
     }

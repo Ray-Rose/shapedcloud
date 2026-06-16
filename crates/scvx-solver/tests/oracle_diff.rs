@@ -114,14 +114,14 @@ fn rust_ipm_matches_oracles_toy_1cone() {
     let params = IpmAlgoParams::default();
     let result = solve_socp(&prob, &params, &mut ws);
 
-    diff_against_oracle("toy", &REF_TOY, result.status, result.x.as_slice());
+    diff_against_oracle("toy", &REF_TOY, result.status, result.x.as_slice(), prob.c.dot(&result.x));
     assert_kkt_optimal("toy/AHO", &prob, &result, 1.0e-3);
 
     // NT direction must reach the same external-oracle optimum on this toy
     // (NT is well-conditioned here — no vanishing cones).
     let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
-    diff_against_oracle("toy/NT", &REF_TOY, res_nt.status, res_nt.x.as_slice());
+    diff_against_oracle("toy/NT", &REF_TOY, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("toy/NT", &prob, &res_nt, 1.0e-3);
 }
 
@@ -155,12 +155,12 @@ fn rust_ipm_matches_oracles_two_cone() {
     let params = IpmAlgoParams::default();
     let result = solve_socp(&prob, &params, &mut ws);
 
-    diff_against_oracle("two_cone", &REF_TWO_CONE, result.status, result.x.as_slice());
+    diff_against_oracle("two_cone", &REF_TWO_CONE, result.status, result.x.as_slice(), prob.c.dot(&result.x));
     assert_kkt_optimal("two_cone/AHO", &prob, &result, 1.0e-3);
 
     let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
-    diff_against_oracle("two_cone/NT", &REF_TWO_CONE, res_nt.status, res_nt.x.as_slice());
+    diff_against_oracle("two_cone/NT", &REF_TWO_CONE, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("two_cone/NT", &prob, &res_nt, 1.0e-3);
 }
 
@@ -185,12 +185,12 @@ fn rust_ipm_matches_oracles_socp_4d() {
     let params = IpmAlgoParams::default();
     let result = solve_socp(&prob, &params, &mut ws);
 
-    diff_against_oracle("socp_4d", &REF_SOCP_4D, result.status, result.x.as_slice());
+    diff_against_oracle("socp_4d", &REF_SOCP_4D, result.status, result.x.as_slice(), prob.c.dot(&result.x));
     assert_kkt_optimal("socp_4d/AHO", &prob, &result, 1.0e-3);
 
     let mut ws_nt = SocpWorkspace::<NP, NE, NCT>::default();
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
-    diff_against_oracle("socp_4d/NT", &REF_SOCP_4D, res_nt.status, res_nt.x.as_slice());
+    diff_against_oracle("socp_4d/NT", &REF_SOCP_4D, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("socp_4d/NT", &prob, &res_nt, 1.0e-3);
 }
 
@@ -198,7 +198,13 @@ fn rust_ipm_matches_oracles_socp_4d() {
 // Diff harness — fail loudly when Rust diverges from the oracle
 // ===========================================================================
 
-fn diff_against_oracle(label: &str, oracle: &OracleReference, status: IpmStatus, x: &[f64]) {
+fn diff_against_oracle(
+    label:  &str,
+    oracle: &OracleReference,
+    status: IpmStatus,
+    x:      &[f64],
+    cost:   f64,
+) {
     eprintln!("--- {} ---", oracle.name);
     eprintln!("  Rust IPM status: {} ({})",
               status_str(status), status.as_u32());
@@ -230,19 +236,16 @@ fn diff_against_oracle(label: &str, oracle: &OracleReference, status: IpmStatus,
         x[worst_i], oracle.expected_x[worst_i], max_err, RUST_VS_ORACLE_TOL
     );
 
-    // Cost agreement (computed as c·x in oracle, here we just check x[c_nonzero]).
-    let cost_idx = (0..x.len())
-        .find(|&i| oracle.expected_x[i] == oracle.expected_cost)
-        .or_else(|| Some(if oracle.expected_cost > 0.0 {
-            // Find the index whose expected value equals expected_cost.
-            (0..oracle.expected_x.len())
-                .min_by(|&a, &b| {
-                    (oracle.expected_x[a] - oracle.expected_cost).abs()
-                        .partial_cmp(&(oracle.expected_x[b] - oracle.expected_cost).abs())
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                }).unwrap_or(0)
-        } else { 0 }));
-    let _ = cost_idx;
+    // Cost agreement: the objective the solver actually minimized (`cᵀx`,
+    // passed in by the caller) must match the oracle's optimal cost.
+    let cost_err = (cost - oracle.expected_cost).abs();
+    eprintln!("  Rust cost {cost:.12} vs oracle {:.12} (err {cost_err:.3e})",
+              oracle.expected_cost);
+    assert!(
+        cost_err < RUST_VS_ORACLE_TOL,
+        "{label}: cost {cost} vs oracle {} (err {cost_err:.3e}, tol {RUST_VS_ORACLE_TOL:.1e})",
+        oracle.expected_cost
+    );
 }
 
 fn status_str(s: IpmStatus) -> &'static str {

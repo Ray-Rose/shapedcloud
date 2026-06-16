@@ -79,11 +79,15 @@ const MIN_SCALE: f64 = 1.0;
 /// | `ν` (7)          | per-component match to `x` scale            |
 /// | `w` (1)          | `1.0` — L2 norm of small `ν` is small       |
 ///
-/// **Why u and σ must match:** the thrust-magnitude cone enforces
-/// `‖u‖ ≤ σ`. Under per-variable scaling, `(u_orig, σ_orig) ∈ SOC^4` ⇔
-/// `(D_u·u_scaled, D_σ·σ_scaled) ∈ SOC^4`. For the scaled iterate to lie
-/// in `SOC^4`, we need `D_u = D_σ` (so the cone is invariant under the
-/// scaling). Same for ν per-component matching x.
+/// **Why u and σ share a scale (conditioning, not feasibility):** column
+/// scaling leaves the cone slack `s = h − G·x` invariant (`G' = G·D`,
+/// `x_scaled = D⁻¹·x_orig` ⇒ `G'·x_scaled = G·x_orig`), so cone membership is
+/// enforced on the *original* slack for ANY positive `D` and feasibility is
+/// preserved regardless of the scale choice. Matching `D_u = D_σ` (and `D_ν`
+/// per-component to the `x` scale) instead keeps the reduced Hessian
+/// `H = D·GᵀMG·D` balanced across the `‖u‖ ≤ σ` cone coupling — a
+/// conditioning choice, not a correctness requirement. (Feasibility
+/// preservation is verified by `scaling_preserves_feasibility`.)
 ///
 /// Returns `D` packed in the 19-per-node layout. Const-generic over `NP`
 /// which must equal `19·N` (fixed-tf) or `19·N + 1` (free-tf, with `δτ`
@@ -272,18 +276,20 @@ pub fn scale_warm_start_in_place<const NP: usize>(
 /// | 4 | Glide slope `(tan(γ)·r_z, r_x, r_y) ∈ SOC^3`     | `pos_scale`                               |
 /// | 5 | T_min `σ − T_min ∈ ℝ_+`                          | `t_max`                                   |
 /// | 6 | T_max `T_max − σ ∈ ℝ_+`                          | `t_max`                                   |
-/// | 7 | Trust region `(η, x − x̄, u − ū) ∈ SOC^{11}`      | `max(trust_eta, pos_scale, thrust_scale)` |
+/// | 7 | Trust region `(η, x − x̄, u − ū) ∈ SOC^{11}`      | `trust_eta` (clamped to `MIN_SCALE`)      |
 /// | 8 | Virtual control L2 `(w, ν) ∈ SOC^8`              | `1`                                       |
 ///
-/// **Why trust cone uses `max(trust_eta, pos_scale, thrust_scale)`:** the
-/// natural slack magnitude is `trust_eta` (the bar is bounded by `η`),
-/// but `prob.h` contains `(η, −x̄, −ū)` with `|x̄|` ~ position scale and
-/// `|ū|` ~ thrust scale. The IPM's dual warm-start initializes `ws.y`
-/// from `prob.h` directly: with cone-row-scaling by `trust_eta` alone,
-/// `ws.y_trust` lands at `(|ū|/trust_eta, 0, ...)` which is enormously
-/// imbalanced vs other cones at `(1, 0, ...)`. Scaling by the larger
-/// value balances the dual at the cost of a tighter slack — the IPM
-/// handles a tight slack better than an imbalanced dual.
+/// **Why the trust cone uses `trust_eta`, NOT `max(trust_eta, pos_scale,
+/// thrust_scale)`:** the natural slack magnitude is `trust_eta` (at the
+/// optimum `x ≈ x̄`, `u ≈ ū`, the slack is `(η, 0, …)`, so `|slack| ~ η`), so
+/// scaling by `trust_eta` keeps the normalized trust slack at ~unit
+/// magnitude. The larger `max(…)` alternative balances the IPM's dual
+/// warm-start better (`prob.h` carries `(η, −x̄, −ū)` whose bar is ~position /
+/// thrust scale) BUT empirically breaks AHO convergence — the effectively-
+/// tightened trust region in scaled coords blows the cost up. The tradeoff
+/// favors the small `e_trust = trust_eta`; the code below
+/// (`let trust_scale = trust_eta.max(MIN_SCALE)`) is the source of truth and
+/// the unit test `cone_scale_matches_documented_table` pins it.
 ///
 /// All entries are clamped to `≥ MIN_SCALE = 1.0` so no cone gets a zero
 /// or negative scale (which would cause division-by-zero or flip the cone

@@ -411,6 +411,17 @@ macro_rules! emit_ffi_per_n {
                 // it the same way, so require finiteness too.
                 || !phys_rs.isp.is_finite() || phys_rs.isp <= 0.0
                 || !phys_rs.g0.is_finite()  || phys_rs.g0  <= 0.0
+                // Drag params feed `v̇` and the STM (continuous.rs / jacobian.rs);
+                // a non-finite `rho`/`cd_a` injects Inf/NaN into the dynamics, and
+                // a negative value is unphysical anti-drag (energy-adding, sign-
+                // flipped `A_vv`) that the solver would silently optimize against.
+                || !phys_rs.rho.is_finite()  || phys_rs.rho  < 0.0
+                || !phys_rs.cd_a.is_finite() || phys_rs.cd_a < 0.0
+                // Cone-shape params feed the pointing / glide-slope cone rows in
+                // `assemble_scvx_socp`; non-finite poisons the SOCP `G`/`h`.
+                // `cos θ_max` is a real cosine (> 0); `tan γ_gs ≥ 0`.
+                || !phys_rs.cos_theta_max.is_finite() || phys_rs.cos_theta_max <= 0.0
+                || !phys_rs.tan_gamma_gs.is_finite()  || phys_rs.tan_gamma_gs  < 0.0
                 || !options_rs.initial_tau.is_finite() || options_rs.initial_tau <= 0.0
                 // target_mass MUST be in [m_dry, m_wet]. Outside this band,
                 // the SCvx outer loop seeds an infeasible reference and

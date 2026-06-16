@@ -600,17 +600,28 @@ const H_REG_RELATIVE: f64 = 1.0e-10;
 /// term over-regularizes (effectively replacing the Newton step with a
 /// gradient step).
 #[inline]
-fn regularization<const NP: usize>(h_mat: &SMatrix<f64, NP, NP>, adaptive: bool) -> f64 {
+fn regularization<const NP: usize>(
+    h_mat:      &SMatrix<f64, NP, NP>,
+    adaptive:   bool,
+    rel_factor: f64,
+) -> f64 {
     if !adaptive {
         return H_REG_FLOOR;
     }
+    // `rel_factor` is the caller's `IpmAlgoParams::regularization`; fall back to
+    // the documented `H_REG_RELATIVE` default if it is non-finite or negative.
+    let rel = if rel_factor.is_finite() && rel_factor >= 0.0 {
+        rel_factor
+    } else {
+        H_REG_RELATIVE
+    };
     let mut trace = 0.0;
     for i in 0..NP {
         trace += h_mat[(i, i)];
     }
     let avg = trace / NP as f64;
     if avg.is_finite() && avg > 0.0 {
-        (avg * H_REG_RELATIVE).max(H_REG_FLOOR)
+        (avg * rel).max(H_REG_FLOOR)
     } else {
         H_REG_FLOOR
     }
@@ -636,6 +647,7 @@ fn build_step_factors<
     s:        &SVector<f64, NCT>,
     y:        &SVector<f64, NCT>,
     adaptive_reg: bool,
+    reg_rel:      f64,
 ) -> Option<StepFactors<NP, NE, NCT>> {
     let arrow_s = build_block_arrow(s, &prob.cones);
     let arrow_y = build_block_arrow(y, &prob.cones);
@@ -643,7 +655,7 @@ fn build_step_factors<
     let m_scale = arrow_s_inv * arrow_y;
 
     let mut h_mat = prob.g_mat.transpose() * m_scale * prob.g_mat;
-    let reg = regularization::<NP>(&h_mat, adaptive_reg);
+    let reg = regularization::<NP>(&h_mat, adaptive_reg, reg_rel);
     for i in 0..NP {
         h_mat[(i, i)] += reg;
     }
@@ -741,6 +753,7 @@ fn build_step_factors_nt<
     s:        &SVector<f64, NCT>,
     y:        &SVector<f64, NCT>,
     adaptive_reg: bool,
+    reg_rel:      f64,
 ) -> Option<NtStepFactors<NP, NE, NCT>> {
     // Per-cone NT computation (W, W⁻¹, s̃).
     let mut w        = SMatrix::<f64, NCT, NCT>::zeros();
@@ -773,7 +786,7 @@ fn build_step_factors_nt<
     // applied per-variable preconditioning), `reg` scales with `tr(H)/n`
     // so the Tikhonov term remains meaningful against `H'` entries ~10^7.
     let mut h_mat = prob.g_mat.transpose() * w_squared * prob.g_mat;
-    let reg = regularization::<NP>(&h_mat, adaptive_reg);
+    let reg = regularization::<NP>(&h_mat, adaptive_reg, reg_rel);
     for i in 0..NP {
         h_mat[(i, i)] += reg;
     }
@@ -1001,7 +1014,7 @@ pub fn solve_socp<
         prev_y = ws.y;
 
         // ---- Factor the Newton matrix (reused for affine + corrector) ----
-        let fac = match build_step_factors(prob, &ws.s, &ws.y, params.use_adaptive_regularization) {
+        let fac = match build_step_factors(prob, &ws.s, &ws.y, params.use_adaptive_regularization, params.regularization) {
             Some(f) => f,
             None    => return numerical_exit(ws, IpmStatus::NumericalError, iter),
         };
@@ -1225,7 +1238,7 @@ pub fn solve_socp_nt<
         prev_y = ws.y;
 
         // ---- NT factors ----
-        let fac = match build_step_factors_nt(prob, &ws.s, &ws.y, params.use_adaptive_regularization) {
+        let fac = match build_step_factors_nt(prob, &ws.s, &ws.y, params.use_adaptive_regularization, params.regularization) {
             Some(f) => f,
             None    => return numerical_exit(ws, IpmStatus::NumericalError, iter),
         };

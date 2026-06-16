@@ -24,13 +24,3 @@ impl<const N: usize> Default for Trajectory<N> {
         }
     }
 }
-
-/// Initial / boundary condition for the 3-DoF problem.
-#[derive(Clone, Copy, Default)]
-pub struct BoundaryCondition {
-    pub r0: [f64; 3],
-    pub v0: [f64; 3],
-    pub m0: f64,
-    pub rf: [f64; 3],
-    pub vf: [f64; 3],
-}
