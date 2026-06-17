@@ -1841,10 +1841,12 @@ outward-facing change not taken lightly for a flight-grade default:
 4. Update the `mars_descent` example + the AHO-baseline-dependent tests to the HSD
    baseline (or add HSD-specific variants alongside).
 
-**RECOMMENDATION**: HSD is ready as the recommended direction NOW; flipping the
-hard production default warrants the checklist above — the same hardening AHO
-received — not a flip ahead of it. AHO remains the conservative default in the
-interim. This is an explicit, reviewable engineering decision, not an oversight.
+**DECISION (confirmed — staged promotion)**: HSD ships as the *recommended* but
+*opt-in* direction NOW; AHO remains the conservative production default. The hard
+default-flip is deliberately deferred behind the checklist above — the same
+hardening AHO received — and is the agreed activation path, NOT an oversight.
+(Reviewed and confirmed: keep AHO default + HSD recommended-opt-in; revisit the
+flip after the checklist.)
 
 ---
 
