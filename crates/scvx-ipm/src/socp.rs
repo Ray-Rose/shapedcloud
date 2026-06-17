@@ -1329,6 +1329,15 @@ pub fn solve_socp_nt<
         // identity e (which is `per_cone_e` from earlier).
         let s_scaled_inv = fac.arrow_s_scaled_inv * e_vec;
 
+        // Centering target `σμ·e` (global). NOTE (NT/O(N) frontier, Phase 24):
+        // a per-cone target `σ·μ_c·e_c` (wide-neighborhood-flavored) was
+        // implemented behind a flag and measured on the flight subproblem — it
+        // is a byte-identical NO-OP at every altitude, because the
+        // Colombo-Gondzio blend already drives ω→0 (rejecting the corrector) on
+        // this ill-conditioned subproblem, so any corrector-centering change is
+        // moot. The divergence is in the affine NT step (the `H = GᵀW²G`
+        // ill-conditioning), not the centering. Reverted; recorded so it isn't
+        // re-treaded. See HANDOFF "Phase 25".
         let r_c_arg_corr = fac.s_scaled + arrow_s_inv_second - s_scaled_inv * (sigma * mu);
 
         // ---- Corrector solve ----

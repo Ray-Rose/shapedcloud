@@ -1421,7 +1421,56 @@ Fixes (1 MEDIUM, 9 LOW — none a flight-path correctness/safety defect):
 - **CI added** — `.github/workflows/ci.yml` (pinned to the MSRV 1.94) runs
   clippy `-D warnings` + the 132-test workspace + the deterministic example +
   the thumb `no_std` (solver + FFI) and host FFI builds on every push / PR. The
-  repo is now self-verifying.
+  repo is now self-verifying. (GitHub-side execution is gated by the account's
+  Actions billing on the private repo — resolves on billing-fix or the public
+  flip, where Actions is free; the workflow is verified green on Linux/WSL2.)
+
+---
+
+## Phase 25 — NT/O(N) frontier: per-cone centering measured + reverted (LANDED)
+
+Continuing the NT-convergence frontier (forward item #1). After the exact
+closed-form NT scaling (Phase 22 — a measured no-op for convergence), the next
+hypothesized lever was the **centering**: the standard Mehrotra target `σμ·e`
+uses the global average `μ`, which on the flight subproblem (per-cone gaps
+spanning ~10¹¹ at the optimum) over-centers the vanishing cones. Implemented a
+**per-cone / wide-neighborhood target `σ·μ_c·e_c`** behind a flag and
+A/B-measured it against global centering on the flight subproblem (altitudes
+2 / 10 / 50 / 100 m, `diag_nt_on_flight_subproblem`).
+
+**Result: byte-identical NO-OP.** NT-per-cone == NT-global to all printed digits
+(same `NumericalError`, same ~21-32 iters, same cost, same residuals) at every
+altitude. Root cause: the Colombo-Gondzio weighted corrector already drives
+**ω→0 (rejecting the corrector entirely)** on this ill-conditioned subproblem, so
+any change to the corrector's centering target is moot. **The divergence is in
+the affine NT step — the `H = GᵀW²G` ill-conditioning from the W² spread — not
+the centering.** Reverted (a measured no-op = dead config); a `NOTE` in
+`solve_socp_nt` records it so it isn't re-treaded.
+
+**Refined frontier conclusion (honest state after Phases 22 + 25).** Three
+incremental NT levers are now measured-exhausted: (a) exact per-cone scaling
+(Phase 22 — no-op), (b) per-cone / wide-neighborhood centering (Phase 25 — no-op,
+corrector rejected), and the earlier (c) iterative refinement (reverted —
+"breakdown is linearization degeneracy, not solve accuracy"). The barrier is
+**intrinsic**: symmetric-NT scaling produces an ill-conditioned affine Newton
+step when cones vanish, and the corrector cannot rescue it. AHO's **asymmetric**
+arrow scaling is empirically robust to vanishing cones (and is the production
+default) — there is no incremental tweak that makes symmetric NT behave like
+asymmetric AHO. Genuinely advancing NT now requires a **different framework**
+(e.g., a homogeneous self-dual embedding / Mehrotra-on-HSD) — a large research
+effort essentially equivalent to a new solver, NOT an incremental fix. The O(N)
+end-to-end win is tied to the same: structured **NT** is blocked by NT
+divergence; structured **AHO** is blocked by the AHO-endgame fallback erosion
+(needs a regularized-Schur / QR structured factorization). Both are
+research-grade.
+
+**Recommendation: NT stays opt-in with graceful AHO fallback; AHO is the
+validated production direction. The NT/O(N) frontier is now thoroughly
+characterized — further progress is a research project (HSD), not a tweak.**
+
+No production behavior change (per-cone centering reverted; the only NT artifacts
+kept are the documenting `NOTE` and the Phase-24 structured-NT exact-scaling
+parity). 132 tests pass (Linux), clippy clean.
 
 ---
 
