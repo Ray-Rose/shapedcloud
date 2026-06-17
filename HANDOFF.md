@@ -1640,6 +1640,13 @@ outer loop, behind `IpmAlgoParams::use_hsd`.
   active-drag envelope (N=5, 100 m, −10 m/s, `rho=0.02, cd_a=50`): the outer loop
   runs to completion (`OuterIterCap`) with **min ‖ν‖ = 3.5e-10**, comparable to
   AHO's 1.58e-10 on the same problem; every inner HSD solve succeeds.
+- **`scvx_converges_with_hsd_free_tf`** — the canonical FREE-tf config (the
+  `mars_descent` example is free-tf): HSD drives the outer loop with the global
+  δτ time-dilation variable IN-BAND (no Sherman-Morrison machinery), reaching
+  **min ‖ν‖ = 1.5e-9** and adapting **τ 10 → 13.94** (matching the example's ~14)
+  — confirming the free-tf δτ extraction flows correctly from the HSD iterate.
+- **`scvx_converges_with_hsd_lunar`** — lunar gravity (g=−1.62, `t_min=300`) on
+  the production base config (column preconditioning only): **min ‖ν‖ = 1.2e-9**.
 
 ### Audit + verification
 
@@ -1648,15 +1655,17 @@ outer loop, behind `IpmAlgoParams::use_hsd`.
   `delta_tau_idx_scvx`, trust/accept, the structured-fallback non-interaction,
   `use_hsd` threading through `warm_ipm_params`, no_std/no-panic) and returned
   **integration sound — no Critical/High/Medium/Low issues**.
-- **138 tests pass** (+2 end-to-end HSD), clippy `-D warnings` clean, thumb
-  no_std (solver + FFI) clean, `mars_descent` byte-identical (`4.3699e3` — the AHO
-  production path is untouched).
+- **140 tests pass** (+4 end-to-end HSD: Mars fixed-tf, Mars free-tf, active-drag,
+  lunar), clippy `-D warnings` clean, thumb no_std (solver + FFI) clean,
+  `mars_descent` byte-identical (`4.3699e3` — the AHO production path is untouched).
 
 ### Honest scope (remaining)
 
-- **Free-tf end-to-end + lunar**: HSD is dimension-generic and the free-tf
-  SUBPROBLEM oracle gate already passes (Phase 26, rel-cost 9.3e-5); a free-tf and
-  a lunar END-TO-END test are cheap follow-ups (the wiring supports them).
+- **Envelope coverage: DONE.** HSD now converges end-to-end across the FULL
+  validated envelope — Mars fixed-tf (formal `Converged`), Mars free-tf (τ adapts
+  10 → 13.94), active-drag, and lunar — all to machine-precision feasibility
+  (‖ν‖ ~1e-9 or better). HSD matches AHO's envelope; on the small Mars case it
+  even reaches a formal `Converged` where plain NT `InnerFail`s.
 - **The O(N) structured HSD** remains the big lift (port the embedded Newton solve
   to the block-tridiagonal Schur). HSD removes the vanishing-cone ill-conditioning
   that blocked structured-NT, so it is now unblocked — where NT and O(N) close.
@@ -1669,11 +1678,12 @@ outer loop, behind `IpmAlgoParams::use_hsd`.
 ## Final state summary
 
 ```
-Tests:      138 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
-              (136 → 138: Phase 27 added +2 END-TO-END HSD outer-loop convergence
-                              tests (scvx_converges_with_hsd: formal Converged,
-                              ‖ν‖ 8.5e-9 where plain NT InnerFails; _active_drag:
-                              ‖ν‖ 3.5e-10) — HSD wired into solve_scvx via
+Tests:      140 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (136 → 140: Phase 27 added +4 END-TO-END HSD outer-loop convergence
+                              tests (Mars fixed-tf: formal Converged, ‖ν‖ 8.5e-9
+                              where plain NT InnerFails; free-tf: ‖ν‖ 1.5e-9, τ
+                              adapts to 13.94; active-drag: ‖ν‖ 3.5e-10; lunar:
+                              ‖ν‖ 1.2e-9) — HSD wired into solve_scvx via
                               IpmAlgoParams::use_hsd)
               (132 → 136: Phase 26 added +2 HSD toy-SOCP tests (scvx-ipm) and +2
                               HSD external-oracle flight-subproblem gates — the

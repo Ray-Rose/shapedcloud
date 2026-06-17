@@ -2739,6 +2739,171 @@ mod tests {
         });
     }
 
+    /// **HSD end-to-end, free-final-time (Phase 27)** — the canonical free-tf
+    /// config (the `mars_descent` example is free-tf): HSD drives the outer loop
+    /// WITH the global δτ time-dilation variable + the two τ-bound cones. HSD is
+    /// dimension-generic, so it solves those in-band (no Sherman-Morrison
+    /// machinery); this confirms the free-tf δτ extraction flows correctly from
+    /// the HSD recovered iterate.
+    #[test]
+    fn scvx_converges_with_hsd_free_tf() {
+        run_in_big_stack(|| {
+            const N: usize         = 3;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX + 1;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX + 2;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX + 2;
+            const MAX_OUTER: usize = 15;
+
+            let phys = mars_params();
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 2.0;
+            x_init[5] = -0.1;
+            x_init[6] = (400.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (380.0_f64).ln();
+
+            let mut workspace: Box<
+                ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>
+            > = Box::default();
+            workspace.reference = linear_reference::<N>(x_init, x_target, 390.0, 10.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    5.0,
+                trust_eta_max: 20.0,
+                trust_eta_min: 1.0e-3,
+                use_free_tf:   true,
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                tol_mu:              1.0e-4,
+                tol_primal:          1.0e-4,
+                tol_dual:            1.0e-4,
+                tol_gap:             1.0e-4,
+                use_hsd:             true,
+                use_preconditioning: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut workspace, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = workspace.iter as usize;
+            let mut min_virt = f64::INFINITY;
+            eprintln!("HSD free-tf SCvx: status = {} after {} outer iters", status as u32, last + 1);
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+                eprintln!(
+                    "  outer {:>2}: cost={:>12.4e}  trust={:>9.3e}  ‖ν‖={:>9.3e}  \
+                     ρ={:>5.3}  accept={}  ipm={}/{}",
+                    r.iter, r.cost, r.trust_eta, r.virt_l1, r.rho_ratio,
+                    r.accepted, r.ipm_status, r.ipm_iters,
+                );
+            }
+            eprintln!("  min ‖ν‖ (accepted) = {:.3e}  τ = {:.4}", min_virt, workspace.reference.tau);
+
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD free-tf: status {} (expected Converged or OuterIterCap)", status as u32
+            );
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                assert!(r.ipm_status == 0 || r.ipm_status == 1,
+                    "iter {}: inner HSD status {} (expected 0 or 1)", i, r.ipm_status);
+            }
+            // Machine-precision feasibility (measured 1.5e-9); 1e-6 keeps margin.
+            assert!(min_virt < 1.0e-6, "HSD free-tf min ‖ν‖ = {:.3e} (expected < 1e-6)", min_virt);
+            // τ was adapted in-band by HSD's δτ; must remain finite + positive.
+            assert!(
+                workspace.reference.tau.is_finite() && workspace.reference.tau > 0.0,
+                "HSD free-tf τ = {} (should be finite positive)", workspace.reference.tau
+            );
+        });
+    }
+
+    /// **HSD end-to-end, lunar gravity (Phase 27)** — the same lunar descent as
+    /// `scvx_converges_lunar_gravity` (g=−1.62, gravity-appropriate `t_min=300`),
+    /// with `use_hsd`. Confirms HSD generalizes beyond Mars gravity on the
+    /// production base config (column preconditioning only).
+    #[test]
+    fn scvx_converges_with_hsd_lunar() {
+        run_in_big_stack(|| {
+            const N: usize         = 5;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 15;
+
+            let phys = PhysicalParams {
+                g:     [0.0, 0.0, -1.62],
+                t_min: 300.0,
+                ..mars_params()
+            };
+
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 100.0;
+            x_init[5] = -10.0;
+            x_init[6] = (800.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (700.0_f64).ln();
+
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> =
+                Box::default();
+            ws.reference = linear_reference_g::<N>(x_init, x_target, 750.0, 25.0, -1.62);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    50.0,
+                trust_eta_max: 200.0,
+                trust_eta_min: 1.0e-3,
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                max_iters:           50,
+                tol_mu:              1.0e-3,
+                tol_primal:          1.0e-3,
+                tol_dual:            1.0e-3,
+                tol_gap:             1.0e-3,
+                use_hsd:             true,
+                use_preconditioning: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut ws, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = ws.iter as usize;
+            let hi = last.min(ws.history.len().saturating_sub(1));
+            let mut min_virt = f64::INFINITY;
+            for i in 0..=hi {
+                let r = &ws.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+                eprintln!(
+                    "  HSD lunar o{:>2}: cost={:>11.4e} trust={:>9.3e} ‖ν‖={:>10.4e} \
+                     ρ={:>7.3} acc={} ipm={}/{}",
+                    r.iter, r.cost, r.trust_eta, r.virt_l1, r.rho_ratio,
+                    r.accepted, r.ipm_status, r.ipm_iters,
+                );
+            }
+            eprintln!("HSD lunar: status={} outer={} min‖ν‖={:.3e}", status as u32, last + 1, min_virt);
+
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD lunar: status {} (expected Converged or OuterIterCap)", status as u32
+            );
+            for i in 0..=hi {
+                assert!(ws.history[i].ipm_status == 0 || ws.history[i].ipm_status == 1,
+                    "iter {}: inner HSD status {} (expected 0 or 1)", i, ws.history[i].ipm_status);
+            }
+            assert!(min_virt < 1.0e-6, "HSD lunar min ‖ν‖ = {:.3e} (expected < 1e-6)", min_virt);
+        });
+    }
+
     /// **NT + full preconditioning — graceful-failure regression**.
     ///
     /// Higham-scaled DB now sits between the eigendecomp path and the
