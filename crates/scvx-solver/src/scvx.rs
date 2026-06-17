@@ -28,7 +28,7 @@ use scvx_core::{
     SolverStatus, Trajectory,
 };
 use scvx_dynamics::{discretize_foh, nonlinear_propagate, LinearizedDynamics};
-use scvx_ipm::{solve_socp, solve_socp_nt, SocpProblem, SocpWorkspace};
+use scvx_ipm::{solve_socp, solve_socp_hsd, solve_socp_nt, SocpProblem, SocpWorkspace};
 
 use crate::assemble::{
     assemble_scvx_socp, delta_tau_idx_scvx, ncones_scvx_free_tf, nct_scvx_free_tf,
@@ -448,7 +448,10 @@ pub fn solve_scvx<
             ..*ipm
         };
 
-        // 3. Solve the inner SOCP. Dispatch matrix (Phase 6.10 — complete):
+        // 3. Solve the inner SOCP. If `use_hsd` is set it OVERRIDES the matrix
+        // below (→ `solve_socp_hsd`, the Phase-26 homogeneous self-dual driver,
+        // which has no structured/NT/free-tf variants — one driver, all cells).
+        // Otherwise the AHO/NT dispatch matrix (Phase 6.10 — complete):
         //
         //   structured  nt   free_tf │ driver                            fallback
         //   ─────────────────────────────────────────────────────────────────────
@@ -466,6 +469,12 @@ pub fn solve_scvx<
         // preserving outer-loop progress at "no worse than dense alone."
         // All four structured cells are verified against their dense
         // reference at machine precision (one-iter equivalence tests).
+        // HSD (Phase 26) takes precedence over NT and the structured solve when
+        // requested: it is its own direction (the homogeneous self-dual
+        // embedding) with no structured variant yet, and it cold-starts central
+        // (the warm-start seeded above is simply unused — harmless). It is
+        // dimension-generic, so the same driver covers fixed- and free-tf.
+        let want_hsd        = warm_ipm_params.use_hsd;
         let want_structured = algo.use_structured_solve;
         let nt = warm_ipm_params.use_nt_scaling;
 
@@ -487,7 +496,14 @@ pub fn solve_scvx<
             }};
         }
 
-        let result = if want_structured && nt {
+        let result = if want_hsd {
+            // Homogeneous self-dual embedded driver (Phase 26). Solves the
+            // (preconditioned, scaled) subproblem directly and returns the
+            // recovered (de-homogenized) scaled iterate, which the outer loop
+            // unscales exactly as for AHO/NT. No structured/free-tf variants —
+            // one driver covers all four cells.
+            solve_socp_hsd(&workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws)
+        } else if want_structured && nt {
             // Structured NT (fixed-tf or free-tf), dense-NT fallback.
             let r = if algo.use_free_tf {
                 solve_socp_structured_nt_free_tf::<N, NP, NE, NCT, NCONES>(
@@ -2505,6 +2521,220 @@ mod tests {
                 workspace.reference.x[(2, 0)] > 0.5,
                 "reference appears to be in scaled coords: r_z[0] = {}",
                 workspace.reference.x[(2, 0)]
+            );
+        });
+    }
+
+    /// **HSD end-to-end convergence (Phase 27)** — the SAME small Mars problem
+    /// on which `nt_full_precond_fails_gracefully` (just below) shows the plain
+    /// NT direction `InnerFail`. With `use_hsd = true`, the homogeneous
+    /// self-dual driver makes the FULL outer loop run to completion with EVERY
+    /// inner solve succeeding (Optimal/BestFeasible) — the end-to-end payoff of
+    /// the Phase-26 frontier crack, wired into `solve_scvx`. HSD cold-starts
+    /// central, so the warm-start is unused; preconditioning still conditions
+    /// the problem data (the config the Phase-26 oracle gates validated).
+    #[test]
+    fn scvx_converges_with_hsd() {
+        run_in_big_stack(|| {
+            const N: usize         = 3;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 15;
+
+            let phys = mars_params();
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 2.0;
+            x_init[5] = -0.1;
+            x_init[6] = (400.0_f64).ln();
+
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (380.0_f64).ln();
+
+            let mut workspace: Box<
+                ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>
+            > = Box::default();
+            workspace.reference = linear_reference::<N>(x_init, x_target, 390.0, 10.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    5.0,
+                trust_eta_max: 20.0,
+                trust_eta_min: 1.0e-3,
+                ..ScvxAlgoParams::default()
+            };
+
+            let ipm = IpmAlgoParams {
+                tol_mu:               1.0e-4,
+                tol_primal:           1.0e-4,
+                tol_dual:             1.0e-4,
+                tol_gap:              1.0e-4,
+                use_hsd:              true,
+                use_preconditioning:  true,
+                use_cone_row_scaling: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(
+                &mut workspace, &phys, &algo, &ipm, &x_init, &term,
+            );
+
+            let last = workspace.iter as usize;
+            let mut min_virt = f64::INFINITY;
+            eprintln!("HSD SCvx: status = {} after {} outer iters", status as u32, last + 1);
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() {
+                    min_virt = min_virt.min(r.virt_l1);
+                }
+                eprintln!(
+                    "  outer {:>2}: cost={:>12.4e}  trust={:>9.3e}  ‖ν‖={:>9.3e}  \
+                     ρ={:>5.3}  accept={}  ipm={}/{}",
+                    r.iter, r.cost, r.trust_eta, r.virt_l1, r.rho_ratio,
+                    r.accepted, r.ipm_status, r.ipm_iters,
+                );
+            }
+            eprintln!("  min ‖ν‖ (accepted) = {:.3e}", min_virt);
+
+            // Headline: NOT InnerFailure, NOT BadInput — the outer loop runs to
+            // completion. The direct contrast with `nt_full_precond_fails_
+            // gracefully`, which InnerFails on this identical problem.
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD end-to-end: got status {} (expected Converged or OuterIterCap)",
+                status as u32
+            );
+
+            // Every inner HSD solve must have produced a usable result.
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                assert!(
+                    r.ipm_status == 0 || r.ipm_status == 1,
+                    "iter {}: inner HSD returned status {} (expected 0=Optimal or 1=BestFeasible)",
+                    i, r.ipm_status
+                );
+            }
+
+            // Cost drops substantially (init ~5e6 → final < 1e4) — same bar as
+            // the AHO full-precond regression.
+            let final_cost = workspace.history[last].cost;
+            assert!(
+                final_cost.is_finite() && final_cost < 1.0e4,
+                "HSD final cost {} should be < 1e4", final_cost
+            );
+
+            // Convergence quality: HSD drives the dynamics defect to
+            // machine-precision feasibility (measured min ‖ν‖ ≈ 8.5e-9) — and on
+            // THIS problem it reaches a formal `Converged`, where plain NT
+            // InnerFails. The < 1e-6 bound is a tight, honest gate with margin.
+            assert!(
+                min_virt < 1.0e-6,
+                "HSD min ‖ν‖ = {:.3e} (expected < 1e-6)", min_virt
+            );
+
+            // Reference finite + in original physical units; τ preserved.
+            for k in 0..N {
+                for i in 0..7 {
+                    assert!(workspace.reference.x[(i, k)].is_finite());
+                }
+            }
+            assert!((workspace.reference.tau - 10.0).abs() < 1e-12, "τ regression");
+            assert!(workspace.reference.x[(2, 0)] > 0.5, "reference in scaled coords?");
+        });
+    }
+
+    /// **HSD on the active-drag envelope (Phase 27)** — the same N=5, 100 m,
+    /// −10 m/s, drag-ON (`rho=0.02, cd_a=50`) descent as
+    /// `scvx_active_drag_path_exercised_and_handled` (the Phase-17 regime), but
+    /// with `use_hsd = true`. Confirms the HSD inner solve generalizes beyond
+    /// the Mars no-drag sweet spot: the outer loop runs to completion with every
+    /// inner solve succeeding and drives the dynamics defect down.
+    #[test]
+    fn scvx_converges_with_hsd_active_drag() {
+        run_in_big_stack(|| {
+            const N: usize         = 5;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 15;
+
+            let phys = PhysicalParams {
+                rho:   0.02,
+                cd_a:  50.0,
+                ..mars_params()
+            };
+
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 100.0;
+            x_init[5] = -10.0;
+            x_init[6] = (800.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (700.0_f64).ln();
+
+            let mut workspace: Box<
+                ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>
+            > = Box::default();
+            workspace.reference = linear_reference::<N>(x_init, x_target, 750.0, 25.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:    50.0,
+                trust_eta_max: 200.0,
+                trust_eta_min: 1.0e-3,
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                max_iters:           50,
+                tol_mu:              1.0e-3,
+                tol_primal:          1.0e-3,
+                tol_dual:            1.0e-3,
+                tol_gap:             1.0e-3,
+                use_hsd:             true,
+                use_preconditioning: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut workspace, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = workspace.iter as usize;
+            let mut min_virt = f64::INFINITY;
+            eprintln!("HSD ACTIVE-DRAG SCvx (N={N}): status = {} after {} outer iters",
+                      status as u32, last + 1);
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+                eprintln!(
+                    "  outer {:>2}: cost={:>12.4e}  trust={:>9.3e}  ‖ν‖={:>9.3e}  \
+                     ρ={:>5.3}  accept={}  ipm={}/{}",
+                    r.iter, r.cost, r.trust_eta, r.virt_l1, r.rho_ratio,
+                    r.accepted, r.ipm_status, r.ipm_iters,
+                );
+            }
+            eprintln!("  min ‖ν‖ (accepted) = {:.3e}", min_virt);
+
+            // The outer loop must run to completion (no InnerFailure/BadInput)
+            // with every inner HSD solve succeeding.
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD active-drag: got status {} (expected Converged or OuterIterCap)",
+                status as u32
+            );
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                assert!(
+                    r.ipm_status == 0 || r.ipm_status == 1,
+                    "iter {}: inner HSD returned status {} (expected 0 or 1)",
+                    i, r.ipm_status
+                );
+            }
+            // Drives the drag-induced defect down to machine-precision feasibility.
+            assert!(
+                min_virt < 1.0e-6,
+                "HSD active-drag min ‖ν‖ = {:.3e} (expected < 1e-6)", min_virt
             );
         });
     }

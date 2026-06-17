@@ -1603,18 +1603,78 @@ floor sits above the loose tolerance even at the optimum (`μ` + primal feasibil
      convergence proof. A polished `Optimal`/infeasibility-certificate path is
      the ECOS/Clarabel-grade finish.
 
-**Recommendation: AHO remains the shipping production default** (HSD is new, not
-yet outer-loop-integrated, and not yet re-audited at the depth AHO has). **HSD is
-the validated path that cracks the NT/O(N) frontier** and is the foundation for
-the O(N) structured solve. Plain NT stays the documented negative result; the
-opt-in `use_nt_scaling` is unchanged.
+**Recommendation: AHO remains the shipping production default** (HSD is new and
+not yet re-audited at the depth AHO has; **Phase 27 below integrates it into the
+SCvx outer loop**). **HSD is the validated path that cracks the NT/O(N) frontier**
+and is the foundation for the O(N) structured solve. Plain NT stays the documented
+negative result; the opt-in `use_nt_scaling` is unchanged.
+
+---
+
+## Phase 27 — HSD wired into the SCvx outer loop (LANDED)
+
+Phase 26 cracked the frontier at the SUBPROBLEM level. Phase 27 makes it
+end-to-end: the homogeneous self-dual driver now drives the full powered-descent
+outer loop, behind `IpmAlgoParams::use_hsd`.
+
+### What landed
+
+- **`IpmAlgoParams::use_hsd`** (default `false`) — parallel to `use_nt_scaling`.
+  When set, the `solve_scvx` inner-solve dispatch routes to `solve_socp_hsd`,
+  taking PRECEDENCE over `use_nt_scaling` and `use_structured_solve` (HSD is its
+  own direction with no structured/free-tf variant — one driver covers all four
+  cells). HSD cold-starts central, so the outer loop's warm-start seed is simply
+  unused (harmless); preconditioning still conditions the problem data, and HSD's
+  recovered SCALED iterate flows through the existing unscale / cost / candidate /
+  free-tf-δτ / trust / accept machinery unchanged (cost `cᵀx` is preconditioning-
+  invariant). AHO stays the production default.
+
+### Measured (end-to-end)
+
+- **`scvx_converges_with_hsd`** — the SAME small N=3 / 2 m Mars problem on which
+  `nt_full_precond_fails_gracefully` shows plain NT `InnerFail`. With `use_hsd`,
+  the full outer loop reaches a **formal `Converged` in 13 outer iters with
+  min ‖ν‖ = 8.5e-9** (machine-precision dynamics feasibility), every inner solve
+  succeeding. The end-to-end payoff of the Phase-26 crack.
+- **`scvx_converges_with_hsd_active_drag`** — HSD generalizes to the Phase-17
+  active-drag envelope (N=5, 100 m, −10 m/s, `rho=0.02, cd_a=50`): the outer loop
+  runs to completion (`OuterIterCap`) with **min ‖ν‖ = 3.5e-10**, comparable to
+  AHO's 1.58e-10 on the same problem; every inner HSD solve succeeds.
+
+### Audit + verification
+
+- An independent integration audit re-traced every consumer of the inner `result`
+  (cost-invariance, `unscale_solution`, `extract_candidate`, the free-tf δτ slot
+  `delta_tau_idx_scvx`, trust/accept, the structured-fallback non-interaction,
+  `use_hsd` threading through `warm_ipm_params`, no_std/no-panic) and returned
+  **integration sound — no Critical/High/Medium/Low issues**.
+- **138 tests pass** (+2 end-to-end HSD), clippy `-D warnings` clean, thumb
+  no_std (solver + FFI) clean, `mars_descent` byte-identical (`4.3699e3` — the AHO
+  production path is untouched).
+
+### Honest scope (remaining)
+
+- **Free-tf end-to-end + lunar**: HSD is dimension-generic and the free-tf
+  SUBPROBLEM oracle gate already passes (Phase 26, rel-cost 9.3e-5); a free-tf and
+  a lunar END-TO-END test are cheap follow-ups (the wiring supports them).
+- **The O(N) structured HSD** remains the big lift (port the embedded Newton solve
+  to the block-tridiagonal Schur). HSD removes the vanishing-cone ill-conditioning
+  that blocked structured-NT, so it is now unblocked — where NT and O(N) close.
+- HSD is not yet the production default (AHO is hardened + flight-validated across
+  more regimes); promoting it would follow free-tf/lunar end-to-end coverage and a
+  deeper independent re-audit.
 
 ---
 
 ## Final state summary
 
 ```
-Tests:      136 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      138 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (136 → 138: Phase 27 added +2 END-TO-END HSD outer-loop convergence
+                              tests (scvx_converges_with_hsd: formal Converged,
+                              ‖ν‖ 8.5e-9 where plain NT InnerFails; _active_drag:
+                              ‖ν‖ 3.5e-10) — HSD wired into solve_scvx via
+                              IpmAlgoParams::use_hsd)
               (132 → 136: Phase 26 added +2 HSD toy-SOCP tests (scvx-ipm) and +2
                               HSD external-oracle flight-subproblem gates — the
                               homogeneous self-dual driver that CONVERGES (to the

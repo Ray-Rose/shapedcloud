@@ -178,6 +178,20 @@ pub struct IpmAlgoParams {
     /// subproblems where cone slack magnitudes span ~6 orders. Has no
     /// effect outside `scvx-solver::solve_scvx`. Defaults to `false`.
     pub use_cone_row_scaling:    bool,
+    /// If `true`, the inner solve uses the **homogeneous self-dual (HSD)
+    /// embedded** driver (`solve_socp_hsd`) instead of the AHO/NT directions.
+    /// HSD converges on the flight-scale SCvx subproblem where the plain NT
+    /// direction DIVERGES (the virtual-control cones vanish at the optimum),
+    /// matching the external CVXPY/Clarabel + Julia oracle far tighter and faster
+    /// than even AHO — see HANDOFF "Phase 26". It cold-starts from the self-dual
+    /// central point, so it IGNORES `warm_start_x` and any seeded `ws.x`, and is
+    /// dimension-generic over fixed-/free-tf (the `δτ` variable and `τ`-bound
+    /// cones are handled transparently — no separate free-tf driver). When set,
+    /// it takes PRECEDENCE over `use_nt_scaling` and `ScvxAlgoParams::
+    /// use_structured_solve` (there is no structured HSD yet — that is the O(N)
+    /// follow-up). Defaults to `false` (AHO remains the hardened production
+    /// default until HSD is re-audited at the same depth).
+    pub use_hsd: bool,
 }
 
 impl Default for IpmAlgoParams {
@@ -196,6 +210,7 @@ impl Default for IpmAlgoParams {
             use_preconditioning:         false,
             use_adaptive_regularization: false,
             use_cone_row_scaling:        false,
+            use_hsd:                     false,
         }
     }
 }
