@@ -41,7 +41,7 @@ use scvx_ipm::{solve_socp, solve_socp_hsd, solve_socp_nt, SocpProblem, SocpResul
 use scvx_solver::{
     assemble_scvx_socp, build_cone_scale_diagonal, build_scaling_diagonal,
     scale_cone_rows_in_place, scale_socp_in_place, scale_warm_start_in_place,
-    sigma_idx_scvx, u_idx_scvx, x_idx_scvx, TerminalCondition,
+    sigma_idx_scvx, solve_socp_structured_hsd, u_idx_scvx, x_idx_scvx, TerminalCondition,
 };
 
 // ---------------------------------------------------------------------------
@@ -541,6 +541,53 @@ fn rust_hsd_matches_external_oracle_scvx_fixedtf() {
         rel < HSD_COST_REL_TOL_FIXEDTF,
         "HSD fixedtf: cost {c:.10e} vs oracle {REF_FIXEDTF_COST:.10e} \
          (rel {rel:.2e} >= {HSD_COST_REL_TOL_FIXEDTF:.1e})"
+    );
+}
+
+/// **O(N) structured HSD** (Phase 28) — the block-tridiagonal-Schur twin of the
+/// dense HSD. This is the gate that proves NT and O(N) finally close TOGETHER:
+/// the SAME structured factorization that diverges under plain NT (the
+/// vanishing-cone `W²` blow-up) is numerically SOUND under HSD (the self-dual
+/// embedding keeps `W` bounded). It must (a) reach the external oracle — a Schur
+/// bug would diverge — and (b) match the dense HSD (the drop-in claim).
+#[test]
+fn rust_structured_hsd_matches_external_oracle_scvx_fixedtf() {
+    let (prob, _warm) = build_fixture_fixedtf(100.0);
+
+    let mut ws = Box::<SocpWorkspace<NP_FX, NE, NCT_FX>>::default();
+    let params = IpmAlgoParams { max_iters: 60, ..IpmAlgoParams::default() };
+    let res = solve_socp_structured_hsd::<N, NP_FX, NE, NCT_FX, NCONES_FX>(&prob, &params, &mut ws);
+
+    let gap = res.s.dot(&res.y).abs() / (NCT_FX as f64);
+    eprintln!(
+        "structured HSD fixedtf: status={} iters={} cost={:.10e} gap={gap:.2e}",
+        res.status.as_u32(), res.iters, cost(&prob, &res)
+    );
+    assert!(
+        matches!(res.status, IpmStatus::Optimal | IpmStatus::BestFeasible),
+        "structured HSD fixedtf: did not converge (status {})", res.status.as_u32()
+    );
+    assert_primal_feasible_report("fixedtf/structured-HSD", &prob, &res, 1.0e-3);
+    assert!(gap < HSD_GAP_BOUND, "structured HSD fixedtf: gap {gap:.2e} exploded");
+
+    // (a) Reaches the external CVXPY/Clarabel + Julia oracle (correctness).
+    let c = cost(&prob, &res);
+    let rel = (c - REF_FIXEDTF_COST).abs() / REF_FIXEDTF_COST.abs().max(1.0);
+    assert!(
+        rel < HSD_COST_REL_TOL_FIXEDTF,
+        "structured HSD fixedtf: cost {c:.10e} vs oracle {REF_FIXEDTF_COST:.10e} (rel {rel:.2e})"
+    );
+
+    // (b) Matches the DENSE HSD (the structured Schur is a drop-in for the dense
+    // H⁻¹/S⁻¹ — both cold-start central and take the same Newton step each iter).
+    let dense = run_hsd(&prob);
+    let c_dense = cost(&prob, &dense);
+    let cost_rel = (c - c_dense).abs() / c_dense.abs().max(1.0);
+    let dx_rel = (res.x - dense.x).norm() / dense.x.norm().max(1.0);
+    eprintln!("  structured-vs-dense HSD: cost rel={cost_rel:.2e}  |Δx|/|x|={dx_rel:.2e}");
+    assert!(
+        cost_rel < 1.0e-4,
+        "structured HSD cost {c:.10e} diverged from dense {c_dense:.10e} (rel {cost_rel:.2e})"
     );
 }
 

@@ -1666,19 +1666,92 @@ outer loop, behind `IpmAlgoParams::use_hsd`.
   10 → 13.94), active-drag, and lunar — all to machine-precision feasibility
   (‖ν‖ ~1e-9 or better). HSD matches AHO's envelope; on the small Mars case it
   even reaches a formal `Converged` where plain NT `InnerFail`s.
-- **The O(N) structured HSD** remains the big lift (port the embedded Newton solve
-  to the block-tridiagonal Schur). HSD removes the vanishing-cone ill-conditioning
-  that blocked structured-NT, so it is now unblocked — where NT and O(N) close.
+- **The O(N) structured HSD** — **DONE (Phase 28 below)**: `solve_socp_structured_
+  hsd` ports the embedded Newton solve to the block-tridiagonal Schur, converges
+  to the oracle (rel-cost 5e-7), and runs end-to-end with ZERO fallbacks. NT and
+  O(N) close together. (Remaining: the structured *free-tf* HSD variant.)
 - HSD is not yet the production default (AHO is hardened + flight-validated across
-  more regimes); promoting it would follow free-tf/lunar end-to-end coverage and a
-  deeper independent re-audit.
+  more regimes); promoting it would follow a deeper independent re-audit.
+
+---
+
+## Phase 28 — O(N) structured HSD: NT and O(N) CLOSE TOGETHER (LANDED)
+
+The last half of the "NT/O(N)" goal. Phase 26 cracked NT convergence; Phase 28
+makes it **linear-time**, and in doing so resolves the *other* long-standing
+frontier — the structured fast path.
+
+### The two structured blockers, both removed by HSD
+
+The HANDOFF's open work item #2 had the structured O(N) path blocked on BOTH
+directions: **structured NT** inherited plain NT's vanishing-cone divergence (the
+`W²` spread blows up the block-tridiagonal Schur off the central path), and
+**structured AHO** suffered *endgame fallback erosion* (the `arrow(s)·arrow(y) →
+singular` AHO endgame, on ~1/3 of subproblems, forces a dense re-solve). HSD has
+NEITHER: the self-dual embedding keeps every cone near-complementary, so
+`soc_nt_scaling_exact` stays bounded, `W²` is well-conditioned, and the SAME
+block-tridiagonal Schur factorization is now numerically sound.
+
+### What landed
+
+- **`scvx_solver::structured_socp::solve_socp_structured_hsd`** — the
+  `O(N·NZ³)` block-tridiagonal-Schur twin of the dense `solve_socp_hsd`
+  (fixed-tf, `NP = N·19`). Algorithmically IDENTICAL to the dense HSD (central
+  start, two-RHS + scalar-`Δτ` reduction, corrector, endgame guard); the ONLY
+  change is that each `[H Aᵀ; A 0]` solve goes through
+  `factor_reduced_kkt_scvx_block_m` + `solve_reduced_kkt_scvx_with_factor`
+  (factor once, apply for the residual RHS and the constant `[c;b;h]` τ-column)
+  instead of dense `H⁻¹`/`S⁻¹`. Reuses the audited `build_per_cone_nt_blocks` +
+  `stack_dz`/`extract_dl`. no_std, no alloc, no panic, bounded-WCET.
+- **Wired into `solve_scvx`**: `use_hsd` + `use_structured_solve` + fixed-tf →
+  `solve_socp_structured_hsd`, with a dense-HSD fallback (which also cold-starts
+  central, so no warm-start re-seed). No structured free-tf HSD yet.
+
+### Measured
+
+- **Reaches the external oracle** (`rust_structured_hsd_matches_external_oracle_
+  scvx_fixedtf`): on the real flight subproblem, structured HSD converges to the
+  CVXPY/Clarabel + Julia optimum at **rel-cost 5e-7** in 14 iters — i.e. the
+  block-tridiagonal Schur that DIVERGES under plain NT is sound under HSD.
+- **Matches the dense HSD** (the drop-in claim): cost rel **4.3e-7**, `‖Δx‖/‖x‖`
+  **8.5e-6**.
+- **End-to-end with ZERO fallbacks** (`scvx_converges_with_hsd_structured`): the
+  full Mars outer loop, driving the O(N) structured HSD every iteration, reaches
+  a formal `Converged` at **‖ν‖ 8.5e-9** (identical to dense) with
+  **`structured_fallbacks = 0`** — vs the ~5/15 fallbacks structured NT/AHO incur
+  on the same problem. The fast path actually delivers, with no erosion.
+
+### Tests (+2): **142 passing**
+
+`rust_structured_hsd_matches_external_oracle_scvx_fixedtf` (oracle + dense
+equivalence) and `scvx_converges_with_hsd_structured` (end-to-end, zero
+fallbacks). clippy `-D warnings` clean, thumb no_std (solver + FFI) clean,
+`mars_descent` byte-identical.
+
+### Honest scope (remaining)
+
+- **Structured free-tf HSD**: compose the HSD τ-coupling with the existing free-tf
+  Sherman-Morrison δτ machinery (`reduced_kkt::*_free_tf`). The dense HSD already
+  handles free-tf in-band; the structured free-tf variant is the last cell.
+- **A formal O(N) scaling benchmark** (wall-clock vs N) like the AHO/NT
+  `wcet_benchmarks` — the per-solve complexity is the same `O(N·NZ³)` the
+  structured AHO/NT paths measure (6.82× at N=7), but unlike them HSD realizes it
+  WITHOUT fallback erosion, so the end-to-end win should actually survive (the
+  Phase-6.12 caveat that killed the structured-AHO end-to-end win does not apply).
+- HSD remains opt-in; AHO is still the hardened production default.
 
 ---
 
 ## Final state summary
 
 ```
-Tests:      140 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      142 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (140 → 142: Phase 28 added the O(N) structured HSD driver
+                              (solve_socp_structured_hsd) + its oracle/dense-
+                              equivalence gate (rel-cost 5e-7) and an end-to-end
+                              SCvx test (Converged, ‖ν‖ 8.5e-9, ZERO structured
+                              fallbacks) — the block-tridiagonal Schur that
+                              diverges under plain NT, sound under HSD)
               (136 → 140: Phase 27 added +4 END-TO-END HSD outer-loop convergence
                               tests (Mars fixed-tf: formal Converged, ‖ν‖ 8.5e-9
                               where plain NT InnerFails; free-tf: ‖ν‖ 1.5e-9, τ
