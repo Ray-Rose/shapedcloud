@@ -1933,6 +1933,284 @@ pub fn solve_socp_structured_hsd<
     }
 }
 
+/// **Free-tf** twin of [`solve_socp_structured_hsd`] (Phase 29 — completes the
+/// structured HSD matrix). The composition of:
+/// - the HSD embedding + two-RHS / scalar-`Δτ` reduction of the fixed-tf
+///   structured HSD, and
+/// - the Sherman-Morrison `δτ`-column machinery of
+///   [`solve_socp_structured_free_tf`] / `_nt_free_tf`
+///   (`factor_reduced_kkt_scvx_block_m_free_tf` + `*_with_factor_free_tf` +
+///   `stack_dz_free_tf`).
+///
+/// The two `τ`s are ORTHOGONAL and compose cleanly: HSD's **homogenizing τ** is
+/// the embedding scalar (handled by the two-RHS + `Δτ` reduction over the FULL
+/// `NP`-vectors), while the SCvx **free-tf δτ** is just a global primal column of
+/// `x` (handled by the SMW rank-1 update INSIDE each structured apply). So this
+/// driver is the fixed-tf structured HSD with the apply/factor/`stack_dz` swapped
+/// to their free-tf variants — nothing in the HSD reduction needs to know one
+/// column of `x` is the time-dilation `δτ`.
+///
+/// **Assumes** free-tf SCvx layout (`NP = N·19 + 1`). Cold-starts central; returns
+/// the recovered de-homogenized iterate `(x,λ,s,y)/τ` (with the `δτ` slot in `x`).
+///
+/// **MAINTENANCE NOTE**: the HSD scaffold mirrors [`solve_socp_structured_hsd`];
+/// the free-tf SMW plumbing mirrors [`solve_socp_structured_nt_free_tf`]. Keep all
+/// three in sync (the one-iter equivalence + oracle tests guard against drift).
+pub fn solve_socp_structured_hsd_free_tf<
+    const N:      usize,
+    const NP:     usize,
+    const NE:     usize,
+    const NCT:    usize,
+    const NCONES: usize,
+>(
+    prob:   &SocpProblem<NP, NE, NCT, NCONES>,
+    params: &IpmAlgoParams,
+    ws:     &mut SocpWorkspace<NP, NE, NCT>,
+) -> SocpResult<NP, NE, NCT> {
+    debug_assert_eq!(NP, N * N_VARS_PER_NODE_SCVX + 1,
+                     "solve_socp_structured_hsd_free_tf: NP must equal N·19 + 1 (free-tf)");
+    debug_assert_eq!(NE, N * NX + 6,
+                     "solve_socp_structured_hsd_free_tf: NE must equal N·7 + 6");
+
+    let e_vec = per_cone_e::<NCT, NCONES>(&prob.cones);
+    let mut xe    = SVector::<f64, NP>::zeros();
+    let mut le    = SVector::<f64, NE>::zeros();
+    let mut se    = e_vec;
+    let mut ze    = e_vec;
+    let mut tau   = 1.0_f64;
+    let mut kappa = 1.0_f64;
+
+    let degree       = (NCONES + 1) as f64;
+    let loose_primal = sqrt(params.tol_primal.max(0.0)).max(1.0e-5);
+    let loose_mu     = sqrt(params.tol_mu.max(0.0)).max(1.0e-5);
+
+    let g_t = prob.g_mat.transpose();
+    // Fixed Tikhonov floor — HSD is central-path-conditioned (no adaptive reg).
+    // See `solve_socp_structured_hsd` for the rationale.
+    let reg: f64 = 1.0e-8;
+
+    let mut best_x:      SVector<f64, NP>  = SVector::zeros();
+    let mut best_lambda: SVector<f64, NE>  = SVector::zeros();
+    let mut best_s:      SVector<f64, NCT> = SVector::zeros();
+    let mut best_y:      SVector<f64, NCT> = SVector::zeros();
+    let mut best_mu = f64::INFINITY;
+    let mut best_valid = false;
+
+    let mut sol_buf:    ReducedKktSolutionFreeTf<N> = ReducedKktSolutionFreeTf::default();
+    let mut factor_buf: ReducedKktFactorFreeTf<N>   = ReducedKktFactorFreeTf::default();
+
+    let extract_dl = |sb: &ReducedKktSolutionFreeTf<N>| -> SVector<f64, NE> {
+        let mut dl = SVector::<f64, NE>::zeros();
+        for i in 0..NX { dl[i] = sb.base.dlam_init[i]; }
+        for k in 0..(N - 1) {
+            for i in 0..NX { dl[NX + k * NX + i] = sb.base.dlam_dyn[k][i]; }
+        }
+        for i in 0..6 { dl[N * NX + i] = sb.base.dlam_term[i]; }
+        dl
+    };
+
+    macro_rules! bail_result {
+        ($it:expr) => {
+            if best_valid {
+                SocpResult {
+                    x: best_x, lambda: best_lambda, s: best_s, y: best_y,
+                    status: IpmStatus::BestFeasible, iters: $it,
+                }
+            } else {
+                numerical_exit(ws, IpmStatus::NumericalError, $it)
+            }
+        };
+    }
+
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
+        let tau_ok   = tau.is_finite()   && tau   > 0.0;
+        let kappa_ok = kappa.is_finite() && kappa > 0.0;
+        if !tau_ok || !kappa_ok {
+            return bail_result!(iter);
+        }
+
+        let r_x = prob.c * tau + prob.a_mat.transpose() * le + g_t * ze;
+        let r_a = prob.a_mat * xe - prob.b * tau;
+        let r_g = prob.g_mat * xe + se - prob.h * tau;
+        let r_t = kappa + prob.c.dot(&xe) + prob.b.dot(&le) + prob.h.dot(&ze);
+        let mu  = (se.dot(&ze) + tau * kappa) / degree;
+
+        let inv_tau  = 1.0 / tau;
+        let rec_x = xe * inv_tau;
+        let rec_l = le * inv_tau;
+        let rec_s = se * inv_tau;
+        let rec_z = ze * inv_tau;
+        ws.x = rec_x;
+        ws.lambda = rec_l;
+        ws.s = rec_s;
+        ws.y = rec_z;
+        let primal_r = (r_a.norm() + r_g.norm()) * inv_tau;
+        let dual_r   = r_x.norm() * inv_tau;
+
+        if mu < params.tol_mu && primal_r < params.tol_primal && dual_r < params.tol_dual {
+            return SocpResult {
+                x: rec_x, lambda: rec_l, s: rec_s, y: rec_z,
+                status: IpmStatus::Optimal, iters: iter,
+            };
+        }
+        if tau > 0.0 && primal_r < loose_primal && mu.is_finite() && mu >= 0.0 && mu < best_mu {
+            best_x = rec_x; best_lambda = rec_l; best_s = rec_s; best_y = rec_z;
+            best_mu = mu; best_valid = true;
+        }
+        if iter > 2 && best_valid && (best_mu < loose_mu || mu > 4.0 * best_mu) {
+            return SocpResult {
+                x: best_x, lambda: best_lambda, s: best_s, y: best_y,
+                status: IpmStatus::BestFeasible, iters: iter,
+            };
+        }
+
+        let (w, w_squared, arrow_s_scaled_inv, s_scaled) =
+            match build_per_cone_nt_blocks(&se, &ze, &prob.cones) {
+                Some(t) => t,
+                None    => return bail_result!(iter),
+            };
+
+        // Factor the SMW-augmented structured Schur with M = W² (once per iter).
+        let st = factor_reduced_kkt_scvx_block_m_free_tf::<N, NP, NE, NCT, NCONES>(
+            prob, &w_squared, reg, &mut factor_buf,
+        );
+        if st != ReducedKktStatus::Ok {
+            return bail_result!(iter);
+        }
+
+        // Free-tf structured apply per RHS (the SMW handles the δτ column).
+        macro_rules! schur_apply {
+            ($bx:expr, $ba:expr) => {{
+                let st = solve_reduced_kkt_scvx_with_factor_free_tf::<N, NP, NE, NCT, NCONES>(
+                    prob, &factor_buf, &$bx, &$ba, &mut sol_buf,
+                );
+                if st != ReducedKktStatus::Ok { return bail_result!(iter); }
+                (stack_dz_free_tf::<N, NP>(&sol_buf), extract_dl(&sol_buf))
+            }};
+        }
+
+        let gw2h   = g_t * (w_squared * prob.h);
+        let bx_tau = gw2h - prob.c;
+        let (dx_t, dl_t) = schur_apply!(bx_tau, prob.b);
+        let d      = prob.c + gw2h;
+        let h_w2_h = prob.h.dot(&(w_squared * prob.h));
+        let coef   = d.dot(&dx_t) + prob.b.dot(&dl_t) - h_w2_h - kappa / tau;
+        if !coef.is_finite() || coef.abs() < 1.0e-300 {
+            return bail_result!(iter);
+        }
+        let neg_r_a = -r_a;
+
+        let ftb = |ds: &SVector<f64, NCT>, dz: &SVector<f64, NCT>, dt: f64, dk: f64| -> f64 {
+            let a_s = max_step_all_cones(&se, ds, &prob.cones);
+            let a_z = max_step_all_cones(&ze, dz, &prob.cones);
+            let a_t = if dt < 0.0 { -tau   / dt } else { f64::INFINITY };
+            let a_k = if dk < 0.0 { -kappa / dk } else { f64::INFINITY };
+            a_s.min(a_z).min(a_t).min(a_k)
+        };
+
+        // ---- Affine ----
+        let r_c_arg_aff = s_scaled;
+        let r6_aff = -tau * kappa;
+        let bx_aff = -r_x + g_t * (w * r_c_arg_aff) - g_t * (w_squared * r_g);
+        let (dx_r_a, dl_r_a) = schur_apply!(bx_aff, neg_r_a);
+        let const_a = d.dot(&dx_r_a) + prob.b.dot(&dl_r_a)
+            - prob.h.dot(&(w * r_c_arg_aff)) + prob.h.dot(&(w_squared * r_g))
+            + r6_aff / tau;
+        let dtau_a = (-r_t - const_a) / coef;
+        let dx_a   = dx_r_a + dx_t * dtau_a;
+        let ds_a   = -r_g - prob.g_mat * dx_a + prob.h * dtau_a;
+        let dz_a   = -(w * r_c_arg_aff) - w_squared * ds_a;
+        let dkap_a = (r6_aff - kappa * dtau_a) / tau;
+
+        let aff_finite = ds_a.iter().all(|v| v.is_finite())
+            && dz_a.iter().all(|v| v.is_finite())
+            && dtau_a.is_finite() && dkap_a.is_finite();
+        if !aff_finite {
+            return bail_result!(iter + 1);
+        }
+        let alpha_a = clip01(BACKOFF * ftb(&ds_a, &dz_a, dtau_a, dkap_a));
+
+        let s_aff   = se    + ds_a   * alpha_a;
+        let z_aff   = ze    + dz_a   * alpha_a;
+        let tau_aff = tau   + dtau_a * alpha_a;
+        let kap_aff = kappa + dkap_a * alpha_a;
+        let mu_aff  = (s_aff.dot(&z_aff) + tau_aff * kap_aff) / degree;
+        let sigma = if mu > 1.0e-300 {
+            let r  = mu_aff / mu;
+            let s3 = r * r * r;
+            if s3.is_finite() { s3.clamp(0.0, 1.0) } else { 0.5 }
+        } else {
+            0.0
+        };
+
+        // ---- Corrector ----
+        let ds_a_scaled = w * ds_a;
+        let dz_a_scaled = -s_scaled - ds_a_scaled;
+        let mut second_order = SVector::<f64, NCT>::zeros();
+        jordan_per_cone(&ds_a_scaled, &dz_a_scaled, &prob.cones, &mut second_order);
+        let arrow_s_inv_second = arrow_s_scaled_inv * second_order;
+        let s_scaled_inv       = arrow_s_scaled_inv * e_vec;
+        let r_c_arg_corr = s_scaled + arrow_s_inv_second - s_scaled_inv * (sigma * mu);
+        let r6_corr = sigma * mu - tau * kappa - dtau_a * dkap_a;
+
+        let bx_corr = -r_x + g_t * (w * r_c_arg_corr) - g_t * (w_squared * r_g);
+        let (dx_r_c, dl_r_c) = schur_apply!(bx_corr, neg_r_a);
+        let const_c = d.dot(&dx_r_c) + prob.b.dot(&dl_r_c)
+            - prob.h.dot(&(w * r_c_arg_corr)) + prob.h.dot(&(w_squared * r_g))
+            + r6_corr / tau;
+        let dtau = (-r_t - const_c) / coef;
+        let dx   = dx_r_c + dx_t * dtau;
+        let dl   = dl_r_c + dl_t * dtau;
+        let ds   = -r_g - prob.g_mat * dx + prob.h * dtau;
+        let dz   = -(w * r_c_arg_corr) - w_squared * ds;
+        let dkap = (r6_corr - kappa * dtau) / tau;
+
+        let step_finite = dx.iter().all(|v| v.is_finite())
+            && dl.iter().all(|v| v.is_finite())
+            && ds.iter().all(|v| v.is_finite())
+            && dz.iter().all(|v| v.is_finite())
+            && dtau.is_finite() && dkap.is_finite();
+        if !step_finite {
+            return bail_result!(iter + 1);
+        }
+
+        let raw   = ftb(&ds, &dz, dtau, dkap);
+        let alpha = clip01(BACKOFF * raw);
+        if alpha <= 0.0 {
+            return bail_result!(iter + 1);
+        }
+
+        xe    += dx   * alpha;
+        le    += dl   * alpha;
+        se    += ds   * alpha;
+        ze    += dz   * alpha;
+        tau   += dtau * alpha;
+        kappa += dkap * alpha;
+
+        if !all_cones_interior(&se, &prob.cones)
+            || !all_cones_interior(&ze, &prob.cones)
+            || tau <= 0.0 || kappa <= 0.0
+        {
+            return bail_result!(iter + 1);
+        }
+        let max_abs = xe.amax().max(se.amax()).max(ze.amax()).max(le.amax())
+            .max(tau.abs()).max(kappa.abs());
+        if !max_abs.is_finite() || max_abs > 1.0e50 {
+            return bail_result!(iter + 1);
+        }
+    }
+
+    if best_valid {
+        SocpResult {
+            x: best_x, lambda: best_lambda, s: best_s, y: best_y,
+            status: IpmStatus::BestFeasible,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
+        }
+    } else {
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

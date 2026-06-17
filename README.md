@@ -61,16 +61,21 @@ library and a `no_std` bare-metal static library.
   Julia/Clarabel oracles) but **diverges on flight-scale subproblems** where the
   relaxation cones vanish at the optimum — a documented limit of symmetric NT
   scaling, not a bug. `HANDOFF.md` records the full investigation.
-- A **homogeneous self-dual (HSD) embedded** direction (`solve_socp_hsd`)
-  **cracks that NT limit** — the production-solver approach (ECOS/Clarabel). On
-  the *same* flight-scale subproblem where plain NT diverges (duality gap → 1e13),
-  HSD converges to the external CVXPY/Clarabel + Julia optimum to **~1e-7 relative
-  cost in 15 iterations** — tighter *and* faster than even AHO, and it converges
-  on cases where AHO itself fails. It is a verified inner solver (not yet wired
-  into the SCvx outer loop, and the O(N) structured version is the next lift); see
-  `HANDOFF.md` "Phase 26".
-- A **block-tridiagonal Schur** primitive provides an O(N) inner solve
-  (per-step machine-precision-equivalent to dense).
+- A **homogeneous self-dual (HSD) embedded** direction (`solve_socp_hsd`, opt-in
+  via `use_hsd`) **cracks that NT limit and is the recommended direction** — the
+  production-solver approach (ECOS/Clarabel). On the *same* flight-scale subproblem
+  where plain NT diverges (duality gap → 1e13), HSD converges to the external
+  CVXPY/Clarabel + Julia optimum to **~1e-7 relative cost in 15 iterations** —
+  tighter *and* faster than even AHO, converging even where AHO itself fails. It
+  is wired **end-to-end** into the SCvx outer loop and converges across the full
+  envelope (Mars fixed/free-tf, drag, lunar); the **O(N) structured HSD**
+  (`use_structured_solve`) is **~7× faster than dense at N=7 and growing, with
+  zero fallbacks** — the linear-time win the structured AHO/NT paths never
+  realized. AHO stays the current *default* pending HSD's flight-hardening
+  checklist (FFI exposure, determinism/WCET re-baseline). See `HANDOFF.md`
+  Phases 26–31.
+- A **block-tridiagonal Schur** primitive provides the O(N) inner solve
+  (per-step machine-precision-equivalent to dense; realized end-to-end by HSD).
 
 ## External-oracle validation
 

@@ -21,11 +21,12 @@ use scvx_core::{
     IpmAlgoParams, IpmStatus, PhysicalParams, ScvxAlgoParams, SolverStatus, Trajectory,
 };
 use scvx_dynamics::{discretize_foh, LinearizedDynamics};
-use scvx_solver::{solve_scvx, ScvxWorkspace};
+use scvx_solver::{solve_scvx, solve_socp_structured_hsd, ScvxWorkspace};
 use scvx_ipm::{
     riccati_factor, riccati_solve, soc_arrow_inv_sqrt, soc_arrow_matrix, soc_det,
     soc_jordan_product, soc_max_step, soc_nt_scaling_matrix, soc_project, soc_sqrt,
-    solve_socp, ConeDesc, LqrProblem, LqrSolution, LqrWorkspace, SocpProblem, SocpWorkspace,
+    solve_socp, solve_socp_hsd, ConeDesc, LqrProblem, LqrSolution, LqrWorkspace,
+    SocpProblem, SocpWorkspace,
 };
 use scvx_solver::assemble::{
     assemble_lcvx_socp, assemble_scvx_socp,
@@ -562,6 +563,153 @@ fn wcet_structured_vs_dense_kkt_inner() {
     eprintln!("  dense scaling ratio  ({:.2}×) should be >= structured ratio ({:.2}×)",
               dense_ratio, struct_ratio);
     // (No hard assert here — host timing is too noisy. Just report.)
+}
+
+/// **Phase 30 — the O(N) HSD scaling benchmark.** Measures the FULL
+/// `solve_socp_structured_hsd` vs the dense `solve_socp_hsd` wall-clock across
+/// N ∈ {3, 5, 7} on assembled SCvx subproblems. The point: unlike the structured
+/// AHO/NT paths — whose per-KKT-solve win does NOT survive to the full solve
+/// (fallback erosion / endgame instability, the Phase-6.12 caveat) — the
+/// structured HSD's win DOES survive end-to-end (HSD is central-path-conditioned,
+/// so the structured factorization is sound every iter with no fallbacks). Both
+/// drivers cold-start central and take identical Newton steps, so they run the
+/// same iteration count; the wall-clock ratio is the O(N·NZ³)-vs-O((N·NZ)³)
+/// structured-Schur speedup, realized for real.
+///
+/// `#[ignore]`d (a release-timing benchmark; the dense N=7 full solve is too slow
+/// in a debug CI run). Run explicitly:
+/// `cargo test --release --test wcet_benchmarks wcet_hsd_structured_vs_dense -- --ignored --nocapture`.
+/// Measured (release, x86_64): N=3 3.4×, N=5 4.95×, N=7 7.05× faster than dense;
+/// structured scales 6.0× (N=3→7) vs dense 12.46× (≈cubic).
+#[test]
+#[ignore]
+fn wcet_hsd_structured_vs_dense_full_solve() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(wcet_hsd_structured_vs_dense_inner)
+        .expect("spawn bench thread")
+        .join()
+        .expect("bench thread panicked");
+}
+
+fn wcet_hsd_structured_vs_dense_inner() {
+    eprintln!("\n--- WCET: structured vs dense HSD FULL solve on SCvx subproblem ---");
+
+    fn bench<
+        const N: usize,
+        const NP: usize,
+        const NE: usize,
+        const NCT: usize,
+        const NCONES: usize,
+    >() -> (u64, u64, f64) {
+        let phys = PhysicalParams {
+            g:             [0.0, 0.0, -3.7114],
+            m_dry:          200.0,
+            m_wet:         1000.0,
+            isp:            225.0,
+            g0:               9.80665,
+            t_min:         1000.0,
+            t_max:         6000.0,
+            cos_theta_max:    0.7660444,
+            tan_gamma_gs:     1.0,
+            rho:              0.0,
+            cd_a:             0.0,
+            tau_lo:           5.0,
+            tau_hi:          50.0,
+        };
+        let mut x_init = SVector::<f64, 7>::zeros();
+        x_init[2] = 500.0; x_init[5] = -20.0; x_init[6] = (800.0_f64).ln();
+        let mut traj = Trajectory::<N>::default();
+        for k in 0..N {
+            for i in 0..7 { traj.x[(i, k)] = x_init[i]; }
+            traj.u[(2, k)] = 800.0 * 3.7114;
+        }
+        traj.tau = 20.0;
+
+        let mut lin = Box::new(LinearizedDynamics::<N>::default());
+        discretize_foh(&traj, &phys, &mut lin, 4);
+
+        let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+        let mut prob = Box::new(SocpProblem::<NP, NE, NCT, NCONES>::default());
+        assemble_scvx_socp::<N, NP, NE, NCT, NCONES>(
+            &traj, &lin, &phys, &x_init, &term,
+            1.0e3, 1.0e4, false, &mut prob,
+        );
+
+        // Both drivers cold-start central (ignore ws.x), so the workspace can be
+        // reused across runs. Fixed max_iters bounds the work identically.
+        let params = IpmAlgoParams { max_iters: 12, ..IpmAlgoParams::default() };
+        let mut ws = Box::new(SocpWorkspace::<NP, NE, NCT>::default());
+
+        // ---- Structured HSD ----
+        for _ in 0..3 {
+            let r = solve_socp_structured_hsd::<N, NP, NE, NCT, NCONES>(&prob, &params, &mut ws);
+            std::hint::black_box(&r);
+        }
+        let n_runs = 20;
+        let t0 = Instant::now();
+        for _ in 0..n_runs {
+            let r = solve_socp_structured_hsd::<N, NP, NE, NCT, NCONES>(&prob, &params, &mut ws);
+            std::hint::black_box(&r);
+        }
+        let t_struct = (t0.elapsed().as_nanos() as u64) / (n_runs as u64);
+
+        // ---- Dense HSD ----
+        for _ in 0..3 {
+            let r = solve_socp_hsd::<NP, NE, NCT, NCONES>(&prob, &params, &mut ws);
+            std::hint::black_box(&r);
+        }
+        let t0 = Instant::now();
+        for _ in 0..n_runs {
+            let r = solve_socp_hsd::<NP, NE, NCT, NCONES>(&prob, &params, &mut ws);
+            std::hint::black_box(&r);
+        }
+        let t_dense = (t0.elapsed().as_nanos() as u64) / (n_runs as u64);
+
+        let speedup = t_dense as f64 / t_struct as f64;
+        (t_struct, t_dense, speedup)
+    }
+
+    const N3: usize = 3;
+    const N3_NP: usize     = N3 * N_VARS_PER_NODE_SCVX;
+    const N3_NE: usize     = N3 * 7 + 6;
+    const N3_NCT: usize    = N3 * N_CONE_DIM_PER_NODE_SCVX;
+    const N3_NCONES: usize = N3 * 8;
+    let (s3, d3, sp3) = bench::<N3, N3_NP, N3_NE, N3_NCT, N3_NCONES>();
+
+    const N5: usize = 5;
+    const N5_NP: usize     = N5 * N_VARS_PER_NODE_SCVX;
+    const N5_NE: usize     = N5 * 7 + 6;
+    const N5_NCT: usize    = N5 * N_CONE_DIM_PER_NODE_SCVX;
+    const N5_NCONES: usize = N5 * 8;
+    let (s5, d5, sp5) = bench::<N5, N5_NP, N5_NE, N5_NCT, N5_NCONES>();
+
+    const N7: usize = 7;
+    const N7_NP: usize     = N7 * N_VARS_PER_NODE_SCVX;
+    const N7_NE: usize     = N7 * 7 + 6;
+    const N7_NCT: usize    = N7 * N_CONE_DIM_PER_NODE_SCVX;
+    const N7_NCONES: usize = N7 * 8;
+    let (s7, d7, sp7) = bench::<N7, N7_NP, N7_NE, N7_NCT, N7_NCONES>();
+
+    eprintln!("  N=3 : structured HSD {:>9} ns,  dense HSD {:>9} ns  ({:>4.2}× faster)", s3, d3, sp3);
+    eprintln!("  N=5 : structured HSD {:>9} ns,  dense HSD {:>9} ns  ({:>4.2}× faster)", s5, d5, sp5);
+    eprintln!("  N=7 : structured HSD {:>9} ns,  dense HSD {:>9} ns  ({:>4.2}× faster)", s7, d7, sp7);
+    eprintln!("  full-solve scaling structured (N=7/N=3): {:.2}×", s7 as f64 / s3 as f64);
+    eprintln!("  full-solve scaling dense      (N=7/N=3): {:.2}×", d7 as f64 / d3 as f64);
+
+    // Smoke (host timing is noisy — report, don't over-assert): the structured
+    // HSD must scale STRICTLY SUB-CUBICALLY relative to dense across N=3→7, i.e.
+    // the dense full solve grows faster than the structured one. (dense ~ N³,
+    // structured ~ N, so dense ratio should exceed structured ratio.)
+    let struct_ratio = s7 as f64 / s3 as f64;
+    let dense_ratio  = d7 as f64 / d3 as f64;
+    assert!(
+        dense_ratio > struct_ratio,
+        "dense HSD should scale faster than structured (dense {dense_ratio:.2}× vs struct {struct_ratio:.2}×) \
+         — the O(N) win"
+    );
+    // And the structured path should win outright at the largest N measured.
+    assert!(s7 < d7, "structured HSD should be faster than dense at N=7 ({s7} vs {d7} ns)");
 }
 
 /// **Phase 6.7 quantitative gate**: measure the per-IPM-iter cost of the

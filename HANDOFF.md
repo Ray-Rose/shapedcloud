@@ -1730,22 +1730,133 @@ fallbacks). clippy `-D warnings` clean, thumb no_std (solver + FFI) clean,
 
 ### Honest scope (remaining)
 
-- **Structured free-tf HSD**: compose the HSD τ-coupling with the existing free-tf
-  Sherman-Morrison δτ machinery (`reduced_kkt::*_free_tf`). The dense HSD already
-  handles free-tf in-band; the structured free-tf variant is the last cell.
-- **A formal O(N) scaling benchmark** (wall-clock vs N) like the AHO/NT
-  `wcet_benchmarks` — the per-solve complexity is the same `O(N·NZ³)` the
-  structured AHO/NT paths measure (6.82× at N=7), but unlike them HSD realizes it
-  WITHOUT fallback erosion, so the end-to-end win should actually survive (the
-  Phase-6.12 caveat that killed the structured-AHO end-to-end win does not apply).
-- HSD remains opt-in; AHO is still the hardened production default.
+- **Structured free-tf HSD** — **DONE (Phase 29)**: composed the HSD τ-coupling
+  with the free-tf Sherman-Morrison δτ machinery; the structured HSD matrix is
+  complete (fixed + free-tf).
+- **A formal O(N) scaling benchmark** — **DONE (Phase 30)**: 3.4×→7.05× faster
+  (N=3→7), and the win survives end-to-end (zero fallbacks) — confirming the
+  Phase-6.12 caveat that killed the structured-AHO win does NOT apply to HSD.
+- HSD remains opt-in; AHO is still the hardened production default. See Phase 31
+  (below) for the promotion assessment.
+
+---
+
+## Phases 29–30 — structured free-tf HSD + the O(N) benchmark (LANDED)
+
+The two remaining HSD extensions from the Phase-28 scope, both done.
+
+### Phase 29 — structured free-tf HSD (completes the structured matrix)
+
+`scvx_solver::structured_socp::solve_socp_structured_hsd_free_tf` — the free-tf
+twin of the fixed-tf structured HSD. It COMPOSES two reductions that turn out to
+be orthogonal:
+- HSD's **homogenizing τ** (the self-dual embedding scalar) — handled by the
+  two-RHS + scalar-`Δτ` reduction over the FULL `NP`-vectors, and
+- the SCvx **free-tf δτ** (time dilation — a global primal COLUMN of `x`) —
+  handled by the Sherman-Morrison rank-1 update INSIDE each structured apply
+  (`factor_reduced_kkt_scvx_block_m_free_tf` + `*_with_factor_free_tf` +
+  `stack_dz_free_tf`).
+
+Nothing in the HSD reduction needs to know one column of `x` is the δτ, so the
+driver is the fixed-tf structured HSD with the apply/factor/`stack_dz` swapped to
+their free-tf variants. Wired into `solve_scvx` (`use_hsd` +
+`use_structured_solve` + free-tf → this driver, dense-HSD fallback). **The
+structured HSD dispatch matrix is now COMPLETE** (fixed-tf + free-tf).
+
+- **Measured**: reaches the external oracle at **rel-cost 3.9e-6** (18 iters);
+  matches the dense free-tf HSD (cost rel 8.9e-5, `‖Δx‖/‖x‖` 1.1e-3); end-to-end
+  (`scvx_converges_with_hsd_structured_free_tf`) the full free-tf outer loop
+  reaches **‖ν‖ 1.5e-9 with ZERO fallbacks** and τ adapts 10 → 13.94.
+
+### Phase 30 — the O(N) scaling benchmark (the win, quantified)
+
+`wcet_benchmarks::wcet_hsd_structured_vs_dense_full_solve` (`#[ignore]`d,
+release-timing) measures the FULL `solve_socp_structured_hsd` vs dense
+`solve_socp_hsd` wall-clock at N ∈ {3,5,7}:
+
+| N | structured HSD | dense HSD | speedup |
+|---|----------------|-----------|---------|
+| 3 | 1.20 ms        | 4.09 ms   | **3.4×**  |
+| 5 | 3.85 ms        | 19.1 ms   | **4.95×** |
+| 7 | 7.23 ms        | 51.0 ms   | **7.05×** |
+
+Structured full-solve scaling N=3→7 is **6.0×** vs dense **12.46×** (≈ `(7/3)³`
+cubic) — the structured path is clearly sub-cubic and the speedup GROWS with N.
+**The decisive point**: this end-to-end win SURVIVES, where the structured AHO/NT
+full-solve win did NOT (the Phase-6.12 caveat — fallback erosion / endgame
+instability). HSD is central-path-conditioned, so the structured factorization is
+sound EVERY iteration (zero fallbacks). The O(N) win is real and realized.
+
+**Tests: 144 passing** (+2: free-tf structured oracle gate + end-to-end) plus the
+`#[ignore]`d release benchmark. clippy `-D warnings` clean, thumb no_std clean.
+
+---
+
+## Phase 31 — HSD re-audit + promotion assessment (LANDED)
+
+A from-scratch re-audit of all HSD code, heading toward promoting HSD from opt-in
+toward the production default.
+
+### Re-audit — clean across every HSD driver + the integration
+
+Independent adversarial audits (each re-derives the math / compares line-by-line,
+NOT trusting the tests) now cover the COMPLETE HSD surface:
+- **dense `solve_socp_hsd`** (Phase 26) — the full embedded Newton system
+  re-derived in Python, reproduced to 1e-13; math correct.
+- **`solve_socp_structured_hsd`** (Phase 28) — faithful mirror of dense; two minor
+  findings fixed (reg-at-floor documented, `ws`-mirror for the no-snapshot path).
+- **`solve_socp_structured_hsd_free_tf`** (Phase 29) — the HSD τ-coupling ×
+  free-tf δτ-SMW composition verified correct (the two τ's are orthogonal, in
+  disjoint code; the δτ column is handled exactly once inside the apply; no
+  τ/δτ confusion). No defects.
+- **the `solve_scvx` dispatch** (Phase 27) — integration sound; every consumer of
+  the inner `result` (cost, unscale, candidate, free-tf δτ slot, trust/accept, the
+  fallback counter, flag threading) re-traced. No issues.
+
+All drivers are no_std / no-panic / no-alloc / bounded-WCET / guarded-divide and
+cross-compile to `thumbv7em-none-eabihf`.
+
+### Promotion assessment — HSD has won on the merits; the hard default-flip is staged
+
+HSD is superior on every axis measured: converges where AHO FAILS (alt=2), with
+5–6 orders tighter duality gap, ~4 orders better oracle-cost match, fewer iters
+(15 vs 60), and O(N) with ZERO fallbacks (7× faster than dense at N=7). It is
+fully audited. **It is now the RECOMMENDED direction** (README + this HANDOFF).
+
+But flipping `IpmAlgoParams::default().use_hsd = true` is a high-blast-radius,
+outward-facing change not taken lightly for a flight-grade default:
+- ~20+ existing tests assert AHO-specific behavior on default params.
+- The `mars_descent` determinism baseline (`4.3699e3` — the cross-platform libm
+  bit-match property) would change.
+- The **FFI C-ABI does not expose `use_hsd`/`use_structured_solve`** (only
+  `use_nt_scaling`/`use_preconditioning`) — C callers could neither opt in nor out.
+- HSD's determinism + WCET have NOT been re-baselined the way AHO's were.
+
+**PROMOTION CHECKLIST** (before flipping the hard default):
+1. Expose `use_hsd` + `use_structured_solve` in the `scvx-ffi` C-ABI (`COptions`
+   + the conversion + the header), with a smoke test.
+2. Re-baseline the libm bit-determinism property + the WCET bound for the HSD path
+   (cross-platform run; per-iter cost vs `IPM_HARD_MAX_ITERS`).
+3. End-to-end N-sweep with HSD up to the FFI's `N = 20`.
+4. Update the `mars_descent` example + the AHO-baseline-dependent tests to the HSD
+   baseline (or add HSD-specific variants alongside).
+
+**RECOMMENDATION**: HSD is ready as the recommended direction NOW; flipping the
+hard production default warrants the checklist above — the same hardening AHO
+received — not a flip ahead of it. AHO remains the conservative default in the
+interim. This is an explicit, reviewable engineering decision, not an oversight.
 
 ---
 
 ## Final state summary
 
 ```
-Tests:      142 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      144 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (142 → 144: Phases 29-30 added the structured FREE-tf HSD oracle gate
+                              (rel-cost 3.9e-6) + its end-to-end test (‖ν‖ 1.5e-9,
+                              0 fallbacks), completing the structured HSD matrix;
+                              plus an #[ignore]d O(N) full-solve benchmark
+                              (structured HSD 3.4x→7.05x faster than dense, N=3→7))
               (140 → 142: Phase 28 added the O(N) structured HSD driver
                               (solve_socp_structured_hsd) + its oracle/dense-
                               equivalence gate (rel-cost 5e-7) and an end-to-end

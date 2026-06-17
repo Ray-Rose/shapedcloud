@@ -42,7 +42,8 @@ use crate::precondition::{
 };
 use crate::structured_socp::{
     solve_socp_structured, solve_socp_structured_free_tf, solve_socp_structured_hsd,
-    solve_socp_structured_nt, solve_socp_structured_nt_free_tf,
+    solve_socp_structured_hsd_free_tf, solve_socp_structured_nt,
+    solve_socp_structured_nt_free_tf,
 };
 
 /// Top-level SCvx workspace. Const-generic over every dim; allocates
@@ -498,17 +499,22 @@ pub fn solve_scvx<
 
         let result = if want_hsd {
             // Homogeneous self-dual embedded driver. When the structured fast
-            // path is ALSO requested and the problem is fixed-tf, use the
-            // O(N·NZ³) block-tridiagonal-Schur HSD (Phase 28) — the same
-            // structure that diverges under plain NT, now numerically sound under
-            // HSD — with a dense-HSD fallback. Otherwise the dense HSD (Phase 26).
-            // There is no structured free-tf HSD yet (the δτ-SMW-on-HSD lift).
-            // HSD returns the recovered de-homogenized scaled iterate, which the
-            // outer loop unscales exactly as for AHO/NT.
-            if want_structured && !algo.use_free_tf {
-                let r = solve_socp_structured_hsd::<N, NP, NE, NCT, NCONES>(
-                    &workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws,
-                );
+            // path is ALSO requested, use the O(N·NZ³) block-tridiagonal-Schur
+            // HSD (Phase 28 fixed-tf / Phase 29 free-tf) — the same structure that
+            // diverges under plain NT, now numerically sound under HSD — with a
+            // dense-HSD fallback. Otherwise the dense HSD (Phase 26). HSD returns
+            // the recovered de-homogenized scaled iterate, which the outer loop
+            // unscales exactly as for AHO/NT.
+            if want_structured {
+                let r = if algo.use_free_tf {
+                    solve_socp_structured_hsd_free_tf::<N, NP, NE, NCT, NCONES>(
+                        &workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws,
+                    )
+                } else {
+                    solve_socp_structured_hsd::<N, NP, NE, NCT, NCONES>(
+                        &workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws,
+                    )
+                };
                 if matches!(r.status, IpmStatus::Optimal | IpmStatus::BestFeasible) {
                     r
                 } else {
@@ -3000,6 +3006,84 @@ mod tests {
                 workspace.structured_fallbacks <= 1,
                 "HSD+structured: {} dense fallbacks (expected ~0 — structured HSD should be stable)",
                 workspace.structured_fallbacks
+            );
+        });
+    }
+
+    /// **HSD + O(N) structured solve, FREE-tf, end-to-end (Phase 29)** — the
+    /// canonical free-tf config with `use_hsd` + `use_structured_solve`, so the
+    /// outer loop drives the inner solve through `solve_socp_structured_hsd_free_
+    /// tf` (the HSD τ-coupling composed with the free-tf Sherman-Morrison δτ).
+    /// Completes the structured HSD matrix end-to-end.
+    #[test]
+    fn scvx_converges_with_hsd_structured_free_tf() {
+        run_in_big_stack(|| {
+            const N: usize         = 3;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX + 1;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX + 2;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX + 2;
+            const MAX_OUTER: usize = 15;
+
+            let phys = mars_params();
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 2.0;
+            x_init[5] = -0.1;
+            x_init[6] = (400.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (380.0_f64).ln();
+
+            let mut workspace: Box<
+                ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>
+            > = Box::default();
+            workspace.reference = linear_reference::<N>(x_init, x_target, 390.0, 10.0);
+
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            let algo = ScvxAlgoParams {
+                trust_eta0:           5.0,
+                trust_eta_max:        20.0,
+                trust_eta_min:        1.0e-3,
+                use_free_tf:          true,    // free-tf
+                use_structured_solve: true,    // O(N) structured HSD free-tf
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                tol_mu:               1.0e-4,
+                tol_primal:           1.0e-4,
+                tol_dual:             1.0e-4,
+                tol_gap:              1.0e-4,
+                use_hsd:              true,
+                use_preconditioning:  true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut workspace, &phys, &algo, &ipm, &x_init, &term);
+
+            let last = workspace.iter as usize;
+            let mut min_virt = f64::INFINITY;
+            eprintln!("HSD+structured free-tf SCvx: status = {} after {} outer iters, fallbacks = {}",
+                      status as u32, last + 1, workspace.structured_fallbacks);
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+            }
+            eprintln!("  min ‖ν‖ (accepted) = {:.3e}  τ = {:.4}", min_virt, workspace.reference.tau);
+
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD+structured free-tf: status {} (expected Converged or OuterIterCap)", status as u32
+            );
+            for i in 0..=last.min(workspace.history.len().saturating_sub(1)) {
+                let r = &workspace.history[i];
+                assert!(r.ipm_status == 0 || r.ipm_status == 1,
+                    "iter {}: inner status {} (expected 0 or 1)", i, r.ipm_status);
+            }
+            assert!(min_virt < 1.0e-6, "HSD+structured free-tf min ‖ν‖ = {:.3e}", min_virt);
+            assert!(
+                workspace.reference.tau.is_finite() && workspace.reference.tau > 0.0,
+                "HSD+structured free-tf τ = {}", workspace.reference.tau
             );
         });
     }

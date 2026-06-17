@@ -41,7 +41,8 @@ use scvx_ipm::{solve_socp, solve_socp_hsd, solve_socp_nt, SocpProblem, SocpResul
 use scvx_solver::{
     assemble_scvx_socp, build_cone_scale_diagonal, build_scaling_diagonal,
     scale_cone_rows_in_place, scale_socp_in_place, scale_warm_start_in_place,
-    sigma_idx_scvx, solve_socp_structured_hsd, u_idx_scvx, x_idx_scvx, TerminalCondition,
+    sigma_idx_scvx, solve_socp_structured_hsd, solve_socp_structured_hsd_free_tf,
+    u_idx_scvx, x_idx_scvx, TerminalCondition,
 };
 
 // ---------------------------------------------------------------------------
@@ -588,6 +589,50 @@ fn rust_structured_hsd_matches_external_oracle_scvx_fixedtf() {
     assert!(
         cost_rel < 1.0e-4,
         "structured HSD cost {c:.10e} diverged from dense {c_dense:.10e} (rel {cost_rel:.2e})"
+    );
+}
+
+/// **O(N) structured free-tf HSD** (Phase 29) — completes the structured HSD
+/// matrix. Composes the HSD τ-coupling with the free-tf Sherman-Morrison δτ
+/// machinery, so the O(N) block-tridiagonal Schur handles the global δτ column.
+/// Must reach the external oracle AND match the dense HSD on the free-tf
+/// subproblem.
+#[test]
+fn rust_structured_hsd_freetf_matches_external_oracle() {
+    let (prob, _warm) = build_fixture_freetf(100.0);
+
+    let mut ws = Box::<SocpWorkspace<NP_FT, NE, NCT_FT>>::default();
+    let params = IpmAlgoParams { max_iters: 60, ..IpmAlgoParams::default() };
+    let res = solve_socp_structured_hsd_free_tf::<N, NP_FT, NE, NCT_FT, NCONES_FT>(&prob, &params, &mut ws);
+
+    let gap = res.s.dot(&res.y).abs() / (NCT_FT as f64);
+    eprintln!(
+        "structured HSD freetf: status={} iters={} cost={:.10e} gap={gap:.2e}",
+        res.status.as_u32(), res.iters, cost(&prob, &res)
+    );
+    assert!(
+        matches!(res.status, IpmStatus::Optimal | IpmStatus::BestFeasible),
+        "structured HSD freetf: did not converge (status {})", res.status.as_u32()
+    );
+    assert_primal_feasible_report("freetf/structured-HSD", &prob, &res, 1.0e-3);
+    assert!(gap < HSD_GAP_BOUND, "structured HSD freetf: gap {gap:.2e} exploded");
+
+    let c = cost(&prob, &res);
+    let rel = (c - REF_FREETF_COST).abs() / REF_FREETF_COST.abs().max(1.0);
+    assert!(
+        rel < HSD_COST_REL_TOL_FREETF,
+        "structured HSD freetf: cost {c:.10e} vs oracle {REF_FREETF_COST:.10e} (rel {rel:.2e})"
+    );
+
+    // Matches the dense free-tf HSD (the SMW-on-HSD composition is a drop-in).
+    let dense = run_hsd(&prob);
+    let c_dense = cost(&prob, &dense);
+    let cost_rel = (c - c_dense).abs() / c_dense.abs().max(1.0);
+    let dx_rel = (res.x - dense.x).norm() / dense.x.norm().max(1.0);
+    eprintln!("  structured-vs-dense free-tf HSD: cost rel={cost_rel:.2e}  |Δx|/|x|={dx_rel:.2e}");
+    assert!(
+        cost_rel < 1.0e-3,
+        "structured free-tf HSD cost {c:.10e} diverged from dense {c_dense:.10e} (rel {cost_rel:.2e})"
     );
 }
 
