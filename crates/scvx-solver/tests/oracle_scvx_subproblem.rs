@@ -37,7 +37,7 @@
 use nalgebra::SVector;
 use scvx_core::{IpmAlgoParams, IpmStatus, PhysicalParams, Trajectory, G_MARS};
 use scvx_dynamics::{discretize_foh, LinearizedDynamics};
-use scvx_ipm::{solve_socp, solve_socp_nt, SocpProblem, SocpResult, SocpWorkspace};
+use scvx_ipm::{solve_socp, solve_socp_hsd, solve_socp_nt, SocpProblem, SocpResult, SocpWorkspace};
 use scvx_solver::{
     assemble_scvx_socp, build_cone_scale_diagonal, build_scaling_diagonal,
     scale_cone_rows_in_place, scale_socp_in_place, scale_warm_start_in_place,
@@ -370,6 +370,16 @@ fn run_nt<const NP: usize, const NE2: usize, const NCT: usize, const NCONES: usi
     solve_socp_nt(prob, &params, &mut ws)
 }
 
+/// HSD ignores the warm-start (it cold-starts from the central point of the
+/// self-dual embedding), so — unlike `run_aho`/`run_nt` — no `ws.x` seed.
+fn run_hsd<const NP: usize, const NE2: usize, const NCT: usize, const NCONES: usize>(
+    prob: &SocpProblem<NP, NE2, NCT, NCONES>,
+) -> SocpResult<NP, NE2, NCT> {
+    let mut ws = Box::<SocpWorkspace<NP, NE2, NCT>>::default();
+    let params = IpmAlgoParams { max_iters: 60, ..IpmAlgoParams::default() };
+    solve_socp_hsd(prob, &params, &mut ws)
+}
+
 /// Diagnostic (ignored): NT vs AHO across subproblem difficulty (altitude).
 ///
 /// **Measured finding (the NT-frontier result).** With the exact closed-form
@@ -392,7 +402,7 @@ fn diag_nt_on_flight_subproblem() {
     eprintln!("alt(m)|dir| st it |       cost       | |Ax-b|  |Gx+s-h| s·y/n");
     for &alt in &[2.0, 10.0, 50.0, 100.0] {
         let (p, w) = build_fixture_fixedtf(alt);
-        for (dir, r) in [("AHO", run_aho(&p, &w)), ("NT ", run_nt(&p, &w))] {
+        for (dir, r) in [("AHO", run_aho(&p, &w)), ("NT ", run_nt(&p, &w)), ("HSD", run_hsd(&p))] {
             let r_a = (p.a_mat * r.x - p.b).norm();
             let r_g = (p.g_mat * r.x + r.s - p.h).norm();
             let compl = (r.s.dot(&r.y)).abs() / (NCT_FX as f64);
@@ -401,6 +411,28 @@ fn diag_nt_on_flight_subproblem() {
                 r.status.as_u32(), r.iters, cost(&p, &r)
             );
         }
+    }
+}
+
+/// Diagnostic (ignored): HSD on the hardest subproblem (alt=100) across an
+/// iteration budget, to characterize the endgame (does τ drift / does it stall?).
+#[test]
+#[ignore]
+fn diag_hsd_iter_sweep_alt100() {
+    let (p, _w) = build_fixture_fixedtf(100.0);
+    eprintln!("HSD alt=100 iter sweep (oracle cost = {REF_FIXEDTF_COST:.6e}):");
+    for &mi in &[10u32, 15, 20, 25, 28, 30, 32, 35, 40, 50, 64] {
+        let mut ws = Box::<SocpWorkspace<NP_FX, NE, NCT_FX>>::default();
+        let params = IpmAlgoParams { max_iters: mi, ..IpmAlgoParams::default() };
+        let r = solve_socp_hsd(&p, &params, &mut ws);
+        let r_a = (p.a_mat * r.x - p.b).norm();
+        let r_g = (p.g_mat * r.x + r.s - p.h).norm();
+        let compl = (r.s.dot(&r.y)).abs() / (NCT_FX as f64);
+        let rel = (cost(&p, &r) - REF_FIXEDTF_COST).abs() / REF_FIXEDTF_COST.abs();
+        eprintln!(
+            "  mi={mi:>2} st={} it={:>2} cost={:>13.5e} relCost={rel:.2e} |Ax-b|={r_a:.2e} |Gx+s-h|={r_g:.2e} gap={compl:.2e}",
+            r.status.as_u32(), r.iters, cost(&p, &r)
+        );
     }
 }
 
@@ -453,5 +485,88 @@ fn rust_ipm_matches_external_oracle_scvx_freetf() {
         rel < COST_REL_TOL_FREETF,
         "freetf: cost {c:.10e} vs oracle {REF_FREETF_COST:.10e} \
          (rel {rel:.2e} >= {COST_REL_TOL_FREETF:.1e})"
+    );
+}
+
+// ===========================================================================
+// HSD-direction external-oracle gates (the NT/O(N) frontier crack).
+//
+// These are the gates the plain-NT direction could NEVER pass: on the SAME
+// flight-scale subproblem, `solve_socp_nt` DIVERGES (primal infeasibility
+// `|Ax-b|` grows to ~9-29, duality gap `s·y/n` explodes to ~1e12-1e14 — see
+// `diag_nt_on_flight_subproblem`). The homogeneous self-dual embedding
+// (`solve_socp_hsd`) instead converges to the external CVXPY/Clarabel + Julia
+// optimum, MORE tightly and faster than even the production AHO default
+// (measured fixed-tf: HSD rel-cost ~8.5e-8 in ~15 iters vs AHO ~5e-4 in 60).
+// HSD cold-starts from the self-dual central point (no warm-start).
+// ===========================================================================
+
+/// Tolerances for the HSD gates. The cost tolerance is ~100x tighter than the
+/// AHO gate's (HSD measured ~8.5e-8 fixed-tf); the gap bound is the load-bearing
+/// assertion — it is what plain NT cannot satisfy (NT diverges to ~1e13 here).
+const HSD_COST_REL_TOL_FIXEDTF: f64 = 1.0e-5;
+const HSD_COST_REL_TOL_FREETF:  f64 = 1.0e-2;
+// "Did not diverge" guard. Plain NT explodes to `s·y/n ~ 1e13` on this
+// subproblem; HSD stays bounded (measured fixed-tf 5.4e-4, free-tf 1.06). A
+// bound of 10 still proves the crack by ~12 orders of magnitude while giving the
+// free-tf endgame (extra δτ variable + 2 τ-bound cones) headroom.
+const HSD_GAP_BOUND:            f64 = 10.0;
+
+#[test]
+fn rust_hsd_matches_external_oracle_scvx_fixedtf() {
+    let (prob, _warm) = build_fixture_fixedtf(100.0);
+    let res = run_hsd(&prob);
+    let gap = res.s.dot(&res.y).abs() / (NCT_FX as f64);
+    eprintln!(
+        "HSD fixedtf: status={} iters={} cost={:.10e} gap={gap:.2e}",
+        res.status.as_u32(), res.iters, cost(&prob, &res)
+    );
+    assert!(
+        matches!(res.status, IpmStatus::Optimal | IpmStatus::BestFeasible),
+        "HSD fixedtf: did not converge (status {})", res.status.as_u32()
+    );
+    assert_primal_feasible_report("fixedtf/HSD", &prob, &res, 1.0e-3);
+
+    // THE crack: HSD stays near-complementary (bounded gap) where plain NT
+    // diverges to `s·y/n ~ 1e13`. This is the assertion NT structurally fails.
+    assert!(
+        gap < HSD_GAP_BOUND,
+        "HSD fixedtf: duality gap {gap:.2e} exploded (plain NT hits ~1e13 here)"
+    );
+
+    // And it nails the external oracle far tighter than AHO.
+    let c = cost(&prob, &res);
+    let rel = (c - REF_FIXEDTF_COST).abs() / REF_FIXEDTF_COST.abs().max(1.0);
+    assert!(
+        rel < HSD_COST_REL_TOL_FIXEDTF,
+        "HSD fixedtf: cost {c:.10e} vs oracle {REF_FIXEDTF_COST:.10e} \
+         (rel {rel:.2e} >= {HSD_COST_REL_TOL_FIXEDTF:.1e})"
+    );
+}
+
+#[test]
+fn rust_hsd_matches_external_oracle_scvx_freetf() {
+    let (prob, _warm) = build_fixture_freetf(100.0);
+    let res = run_hsd(&prob);
+    let gap = res.s.dot(&res.y).abs() / (NCT_FT as f64);
+    eprintln!(
+        "HSD freetf: status={} iters={} cost={:.10e} gap={gap:.2e}",
+        res.status.as_u32(), res.iters, cost(&prob, &res)
+    );
+    assert!(
+        matches!(res.status, IpmStatus::Optimal | IpmStatus::BestFeasible),
+        "HSD freetf: did not converge (status {})", res.status.as_u32()
+    );
+    assert_primal_feasible_report("freetf/HSD", &prob, &res, 1.0e-3);
+    assert!(
+        gap < HSD_GAP_BOUND,
+        "HSD freetf: duality gap {gap:.2e} exploded (plain NT diverges here)"
+    );
+    let c = cost(&prob, &res);
+    let rel = (c - REF_FREETF_COST).abs() / REF_FREETF_COST.abs().max(1.0);
+    assert!(
+        rel < HSD_COST_REL_TOL_FREETF,
+        "HSD freetf: cost {c:.10e} vs oracle {REF_FREETF_COST:.10e} \
+         (rel {rel:.2e} >= {HSD_COST_REL_TOL_FREETF:.1e})"
     );
 }

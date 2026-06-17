@@ -12,7 +12,9 @@
 
 use nalgebra::{SMatrix, SVector};
 use scvx_core::{IpmAlgoParams, IpmStatus};
-use scvx_ipm::{solve_socp, solve_socp_nt, ConeDesc, SocpProblem, SocpResult, SocpWorkspace};
+use scvx_ipm::{
+    solve_socp, solve_socp_hsd, solve_socp_nt, ConeDesc, SocpProblem, SocpResult, SocpWorkspace,
+};
 
 /// **Self-consistent optimality oracle** (no external reference needed):
 /// verify the returned (x, λ, s, y) actually satisfy the SOCP KKT conditions —
@@ -123,6 +125,13 @@ fn rust_ipm_matches_oracles_toy_1cone() {
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
     diff_against_oracle("toy/NT", &REF_TOY, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("toy/NT", &prob, &res_nt, 1.0e-3);
+
+    // HSD direction must reach the same external-oracle optimum (the optimum
+    // sits on the cone boundary — the vanishing-cone case the embedding handles).
+    let mut ws_hsd = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_hsd = solve_socp_hsd(&prob, &params, &mut ws_hsd);
+    diff_against_oracle("toy/HSD", &REF_TOY, res_hsd.status, res_hsd.x.as_slice(), prob.c.dot(&res_hsd.x));
+    assert_kkt_optimal("toy/HSD", &prob, &res_hsd, 1.0e-3);
 }
 
 #[test]
@@ -162,6 +171,11 @@ fn rust_ipm_matches_oracles_two_cone() {
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
     diff_against_oracle("two_cone/NT", &REF_TWO_CONE, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("two_cone/NT", &prob, &res_nt, 1.0e-3);
+
+    let mut ws_hsd = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_hsd = solve_socp_hsd(&prob, &params, &mut ws_hsd);
+    diff_against_oracle("two_cone/HSD", &REF_TWO_CONE, res_hsd.status, res_hsd.x.as_slice(), prob.c.dot(&res_hsd.x));
+    assert_kkt_optimal("two_cone/HSD", &prob, &res_hsd, 1.0e-3);
 }
 
 #[test]
@@ -192,6 +206,11 @@ fn rust_ipm_matches_oracles_socp_4d() {
     let res_nt = solve_socp_nt(&prob, &params, &mut ws_nt);
     diff_against_oracle("socp_4d/NT", &REF_SOCP_4D, res_nt.status, res_nt.x.as_slice(), prob.c.dot(&res_nt.x));
     assert_kkt_optimal("socp_4d/NT", &prob, &res_nt, 1.0e-3);
+
+    let mut ws_hsd = SocpWorkspace::<NP, NE, NCT>::default();
+    let res_hsd = solve_socp_hsd(&prob, &params, &mut ws_hsd);
+    diff_against_oracle("socp_4d/HSD", &REF_SOCP_4D, res_hsd.status, res_hsd.x.as_slice(), prob.c.dot(&res_hsd.x));
+    assert_kkt_optimal("socp_4d/HSD", &prob, &res_hsd, 1.0e-3);
 }
 
 // ===========================================================================

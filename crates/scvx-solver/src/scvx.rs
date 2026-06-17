@@ -213,6 +213,19 @@ pub fn solve_scvx<
         || algo.trust_eta_max < algo.trust_eta_min
         || !algo.trust_alpha.is_finite()
         || !algo.trust_beta.is_finite()
+        // `trust_alpha` is ALWAYS a divisor on the shrink path
+        // (`trust_eta / trust_alpha`, lines ~543/748). A value `<= 1.0` is
+        // pathological: `0.0` divides-by-zero to ±∞ (or `0/0 = NaN` when
+        // `trust_eta` has collapsed to the `eta_min = 0` floor), a negative
+        // flips the trust sign, and exactly `1.0` makes the Phase-17 shrink-
+        // retry a no-op (it can never tighten an unsolvable subproblem, so the
+        // retry loop just re-fails). `trust_beta` multiplies on the grow path;
+        // `< 1.0` would *shrink* on a good step (wrong direction). The
+        // `candidate_finite` guard downstream already prevents a NaN trust from
+        // corrupting the trajectory, but the documented contract is to reject
+        // pathological algo params up front with `BadInput`.
+        || algo.trust_alpha <= 1.0
+        || algo.trust_beta < 1.0
         || !algo.virt_weight.is_finite()
         || algo.virt_weight < 0.0
     {
@@ -787,7 +800,9 @@ fn extract_candidate<const N: usize, const NP: usize>(
         }
         candidate.sigma[k] = x_full[sigma_idx_scvx(k)];
     }
-    // τ unchanged (fixed-tf in P7); free-tf is a later phase.
+    // `extract_candidate` fills only the per-node state/control/σ. `τ` is set by
+    // the caller in `solve_scvx`: preserved at `reference.tau` for fixed-tf, or
+    // set to the clamped `prop_tau = (τ_ref + δτ)` for free-tf (both landed).
 }
 
 /// Seed the IPM primal vector at the reference trajectory.
@@ -1222,6 +1237,30 @@ mod tests {
                 solve_scvx(&mut ws, &phys_inverted, &algo, &ipm, &x_init, &term),
                 SolverStatus::BadInput
             ), "t_max < t_min should yield BadInput");
+
+            // Attack 9: zero trust-shrink factor (`trust_alpha = 0` is a divisor
+            // on the shrink path — div-by-zero / sign flip; must be > 1).
+            let algo_bad_alpha = ScvxAlgoParams {
+                trust_alpha: 0.0,
+                ..ScvxAlgoParams::default()
+            };
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = fresh_ws();
+            assert!(matches!(
+                solve_scvx(&mut ws, &phys, &algo_bad_alpha, &ipm, &x_init, &term),
+                SolverStatus::BadInput
+            ), "trust_alpha <= 1 should yield BadInput");
+
+            // Attack 10: wrong-direction grow factor (`trust_beta < 1` shrinks
+            // on a GOOD step — must be >= 1).
+            let algo_bad_beta = ScvxAlgoParams {
+                trust_beta: 0.5,
+                ..ScvxAlgoParams::default()
+            };
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = fresh_ws();
+            assert!(matches!(
+                solve_scvx(&mut ws, &phys, &algo_bad_beta, &ipm, &x_init, &term),
+                SolverStatus::BadInput
+            ), "trust_beta < 1 should yield BadInput");
         });
     }
 

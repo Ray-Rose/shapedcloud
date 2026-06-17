@@ -1484,6 +1484,374 @@ fn numerical_exit<const NP: usize, const NE: usize, const NCT: usize>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// HSD-direction Mehrotra driver (homogeneous self-dual embedding).
+// ---------------------------------------------------------------------------
+
+/// Apply the cached NT Schur factor to ONE right-hand side `(bx, ba)`, solving
+/// ```text
+///   [ H   Aᵀ ] [Δx]   [ bx ]
+///   [ A   0  ] [Δλ] = [ ba ]
+/// ```
+/// via the Schur complement `S = A·H⁻¹·Aᵀ` (both `H⁻¹` and `S⁻¹` precomputed in
+/// `fac`). HSD solves this core system TWICE per Newton iteration — once for the
+/// residual RHS and once for the constant τ-coupling column `[c; b; h]` — so the
+/// expensive factor is built once (`build_step_factors_nt`) and applied many
+/// times, the same factor/apply economy the structured drivers use.
+#[inline]
+fn nt_schur_apply<
+    const NP: usize, const NE: usize, const NCT: usize, const NCONES: usize,
+>(
+    prob: &SocpProblem<NP, NE, NCT, NCONES>,
+    fac:  &NtStepFactors<NP, NE, NCT>,
+    bx:   &SVector<f64, NP>,
+    ba:   &SVector<f64, NE>,
+) -> (SVector<f64, NP>, SVector<f64, NE>) {
+    let dl = fac.s_inv * (prob.a_mat * (fac.h_inv * bx) - ba);
+    let dx = fac.h_inv * (bx - prob.a_mat.transpose() * dl);
+    (dx, dl)
+}
+
+/// Mehrotra predictor-corrector IPM on the **homogeneous self-dual (HSD)
+/// embedding** of the SOCP — the NT/O(N) frontier path (HANDOFF "Phase 26").
+///
+/// ## Why HSD (the crack)
+///
+/// The plain primal-dual NT driver ([`solve_socp_nt`]) DIVERGES on the flight-
+/// scale SCvx subproblem: its virtual-control SOC^8 cones VANISH at the optimum
+/// (the relaxation drives ν→0), the iterates drift OFF the central path (per-
+/// cone complementarity spans ~10^11), and `H = Gᵀ·W²·G` becomes catastrophically
+/// ill-conditioned. Phases 15/22/25 measured the three incremental NT levers
+/// (exact per-cone scaling, per-cone/wide-neighborhood centering, iterative
+/// refinement) as no-ops: symmetric-NT scaling intrinsically produces an
+/// ill-conditioned affine step when cones vanish off-centre.
+///
+/// HSD is the production-solver fix (ECOS, Clarabel). It embeds (P)/(D) into a
+/// single SELF-DUAL system with two extra scalars — `τ` (homogenizing) and `κ`
+/// (its complementary slack) — and path-follows the EMBEDDED central path, where
+/// every cone AND the `(τ,κ)` ray share ONE `μ`. That near-complementarity
+/// (`s∘z ≈ μe` per cone) is exactly the regime where
+/// [`crate::cone::soc_nt_scaling_exact`] is provably bounded (`s̄≈z̄ ⇒ w̄≈e ⇒
+/// W≈η·I`) even as `det→0`, so the `W²`-spread that destroys the plain NT step
+/// never forms. The homogenizing `τ` also removes the need for a feasible
+/// warm-start: HSD cold-starts from the strictly-feasible central point.
+///
+/// ## Embedding (this crate's standard form `min cᵀx s.t. Ax=b, Gx+s=h, s∈K`)
+///
+/// Find `(x, λ, z, s, τ, κ)`, `s,z ∈ K`, `τ,κ ≥ 0`, solving the skew-symmetric
+/// self-dual system as `μ → 0` (`z` is the cone dual the other drivers call `y`):
+/// ```text
+///   Aᵀλ + Gᵀz + cτ        = 0      (R_x  dual feasibility, homogenized)
+///   Ax            − bτ    = 0      (R_λ  primal-equality feasibility)
+///   Gx + s        − hτ    = 0      (R_g  primal-cone feasibility)
+///   cᵀx + bᵀλ + hᵀz + κ   = 0      (R_t  the self-dual gap row)
+///   s ∘ z = μ e ,   τ κ = μ
+/// ```
+/// The 4×4 operator is skew-symmetric (`Mᵀ = −M`), so the embedding is self-dual.
+/// At `μ=0`: `τ>0 ⇒ (x,λ,s,z)/τ` solves (P)/(D); `τ=0, κ>0 ⇒` a primal/dual
+/// infeasibility certificate. Central start: `x=0, λ=0, s=z=e, τ=κ=1` (`μ₀=1`).
+///
+/// ## Newton step (NT-scaled; τ via two-RHS + scalar-Δτ reduction)
+///
+/// Reuses [`build_step_factors_nt`] for the `H=Gᵀ·W²·G`, `S=A·H⁻¹·Aᵀ`
+/// factorization at the embedded `(s,z)`. The `τ`-coupling makes the system
+/// non-separable; eliminating `Δs` (cone-feasibility row) and `Δz` (NT
+/// complementarity, giving the same `Δz = −W·r_c_arg − W²·Δs` relation the plain
+/// NT driver uses) leaves a `(Δx,Δλ)` system that is AFFINE in the scalar `Δτ`:
+/// ```text
+///   [H Aᵀ][Δx]   [ bx_res + (GᵀW²h − c)·Δτ ]
+///   [A 0 ][Δλ] = [ ba_res + b·Δτ           ]
+/// ```
+/// Solve the core system for the residual RHS `(bx_res, ba_res)` and the constant
+/// τ-column `(GᵀW²h−c, b)` → `(Δx_r,Δλ_r)`, `(Δx_t,Δλ_t)`. Substituting
+/// `Δx = Δx_r + Δτ·Δx_t` into the gap row gives ONE scalar equation for `Δτ`
+/// (denominator `coef`), then back-substitute `Δx,Δλ,Δs,Δz,Δκ`. Derivation inline.
+///
+/// ## Contract
+///
+/// Same return shape as [`solve_socp`]/[`solve_socp_nt`]: the recovered
+/// (de-homogenized) `(x,λ,s,y) = (x,λ,s,z)/τ`, a status, and the iteration count.
+/// HSD cold-starts centrally (ignores `warm_start_x` / the seeded `ws.x`); `ws`
+/// is reused only for the recovered iterate + best-feasible snapshot. Every
+/// buffer is on the stack; no alloc, no panic on any path; the loop is bounded by
+/// `min(max_iters, IPM_HARD_MAX_ITERS)`.
+pub fn solve_socp_hsd<
+    const NP:     usize,
+    const NE:     usize,
+    const NCT:    usize,
+    const NCONES: usize,
+>(
+    prob:   &SocpProblem<NP, NE, NCT, NCONES>,
+    params: &IpmAlgoParams,
+    ws:     &mut SocpWorkspace<NP, NE, NCT>,
+) -> SocpResult<NP, NE, NCT> {
+    // ---- Cone-descriptor validation (panic-freedom on external input) ----
+    if !cones_valid::<NCT, NCONES>(&prob.cones) {
+        return SocpResult {
+            x: SVector::zeros(), lambda: SVector::zeros(),
+            s: SVector::zeros(), y: SVector::zeros(),
+            status: IpmStatus::NumericalError,
+            iters:  0,
+        };
+    }
+
+    // ---- Embedded variables (local; recovered into `ws` each iteration) ----
+    // Strictly-feasible central start: x=0, λ=0, s=z=e (per-cone identity),
+    // τ=κ=1. No warm-start needed — that is HSD's structural advantage.
+    let e_vec = per_cone_e::<NCT, NCONES>(&prob.cones);
+    let mut xe    = SVector::<f64, NP>::zeros();
+    let mut le    = SVector::<f64, NE>::zeros();
+    let mut se    = e_vec;
+    let mut ze    = e_vec;
+    let mut tau   = 1.0_f64;
+    let mut kappa = 1.0_f64;
+
+    ws.best_mu    = f64::INFINITY;
+    ws.best_valid = false;
+
+    // Barrier degree of the embedded cone K × ℝ₊ = (#cones) + 1 (the (τ,κ) ray).
+    // The SOC barrier degree is 1 PER cone (not its dim): on the central path
+    // `s_c ∘ z_c = μ e_c` gives `s_c·z_c = μ`, so total `s·z = μ·NCONES`.
+    let degree       = (NCONES + 1) as f64;
+    let loose_primal = libm::sqrt(params.tol_primal.max(0.0)).max(1.0e-5);
+    let loose_mu     = libm::sqrt(params.tol_mu.max(0.0)).max(1.0e-5);
+
+    let g_t = prob.g_mat.transpose();
+
+    for iter in 0..params.max_iters.min(IPM_HARD_MAX_ITERS) {
+        // `τ`/`κ` must stay finite and strictly positive (the embedded ℝ₊ ray).
+        let tau_ok   = tau.is_finite()   && tau   > 0.0;
+        let kappa_ok = kappa.is_finite() && kappa > 0.0;
+        if !tau_ok || !kappa_ok {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter);
+        }
+
+        // ---- Embedded residuals (drive each to 0) ----
+        let r_x = prob.c * tau
+                + prob.a_mat.transpose() * le
+                + g_t * ze;                                  // R_x  (NP)
+        let r_a = prob.a_mat * xe - prob.b * tau;            // R_λ  (NE)
+        let r_g = prob.g_mat * xe + se - prob.h * tau;       // R_g  (NCT)
+        let r_t = kappa
+                + prob.c.dot(&xe)
+                + prob.b.dot(&le)
+                + prob.h.dot(&ze);                           // R_t  (scalar)
+
+        let mu = (se.dot(&ze) + tau * kappa) / degree;
+
+        // ---- Recover the current iterate into `ws` (live fallback) ----
+        let inv_tau = 1.0 / tau;
+        ws.x      = xe * inv_tau;
+        ws.lambda = le * inv_tau;
+        ws.s      = se * inv_tau;
+        ws.y      = ze * inv_tau;
+
+        // De-homogenized residuals (the original-problem residuals are the
+        // embedded residuals divided by τ).
+        let primal_r = (r_a.norm() + r_g.norm()) * inv_tau;
+        let dual_r   = r_x.norm() * inv_tau;
+
+        // ---- Termination (strict) ----
+        if mu < params.tol_mu && primal_r < params.tol_primal && dual_r < params.tol_dual {
+            return SocpResult {
+                x: ws.x, lambda: ws.lambda, s: ws.s, y: ws.y,
+                status: IpmStatus::Optimal,
+                iters:  iter,
+            };
+        }
+
+        // ---- Best-feasible snapshot (recovered space) ----
+        // Key on primal feasibility + the embedded gap `μ` (the HSD
+        // suboptimality measure). The dual residual is deliberately NOT gated
+        // here: with a large preconditioned cost vector (`virt_weight ~ 1e5`)
+        // the recovered dual residual's absolute floor sits above the loose
+        // tolerance even at the optimum, yet small `μ` + primal feasibility +
+        // `τ > 0` already certify near-optimality in the self-dual embedding.
+        if tau > 0.0
+            && primal_r < loose_primal
+            && mu.is_finite()
+            && mu >= 0.0
+            && mu < ws.best_mu
+        {
+            ws.best_x      = ws.x;
+            ws.best_lambda = ws.lambda;
+            ws.best_s      = ws.s;
+            ws.best_y      = ws.y;
+            ws.best_mu     = mu;
+            ws.best_valid  = true;
+        }
+
+        // ---- Graceful endgame exit (the robustness fix) ----
+        // Once a good-enough snapshot exists, STOP. Driving `μ → 0` further
+        // pushes the embedded `(τ,κ) → 0` region where the NT scaling
+        // re-conditions badly and `τ` can collapse (the recovered `x/τ` then
+        // blows up — the measured alt=100 breakdown at iter ~30). Exit when the
+        // snapshot gap is already tight (`< loose_mu`), OR when the LIVE gap has
+        // regressed past 4× the best (overshoot past the optimum detected) —
+        // returning the captured near-optimal iterate. Mirrors the AHO/NT
+        // endgame guards; without it HSD reaches the optimum (~iter 20) then
+        // diverges by iter ~30.
+        if iter > 2 && ws.best_valid && (ws.best_mu < loose_mu || mu > 4.0 * ws.best_mu) {
+            return numerical_exit(ws, IpmStatus::BestFeasible, iter);
+        }
+
+        // ---- NT factor at the EMBEDDED cone iterate (s, z) ----
+        // `build_step_factors_nt` routes per cone through `soc_nt_scaling_exact`
+        // (bounded on the central path), giving `W`, `W²`, `arrow(s̃)⁻¹`, `s̃=W·s`,
+        // `H⁻¹`, `S⁻¹`. This is the expensive factor — reused for both RHS below.
+        let fac = match build_step_factors_nt(
+            prob, &se, &ze, params.use_adaptive_regularization, params.regularization,
+        ) {
+            Some(f) => f,
+            None    => return numerical_exit(ws, IpmStatus::NumericalError, iter),
+        };
+        let w  = fac.w;
+        let w2 = fac.w_squared;
+
+        // ---- τ-coupling precompute (independent of σ / corrector) ----
+        // τ-column of the core system: bx_tau = GᵀW²h − c, ba_tau = b.
+        // d = c + GᵀW²h ; coef = the Δτ-equation denominator (gap row).
+        let gw2h   = g_t * (w2 * prob.h);
+        let bx_tau = gw2h - prob.c;
+        let (dx_t, dl_t) = nt_schur_apply(prob, &fac, &bx_tau, &prob.b);
+        let d      = prob.c + gw2h;
+        let h_w2_h = prob.h.dot(&(w2 * prob.h));
+        let coef   = d.dot(&dx_t) + prob.b.dot(&dl_t) - h_w2_h - kappa / tau;
+        if !coef.is_finite() || coef.abs() < 1.0e-300 {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter);
+        }
+
+        // ---- HSD Newton direction for a given (r_c_arg, r6) ----
+        // `r_c_arg` = scaled-coords complementarity argument `arrow(s̃)⁻¹·F̃₄`;
+        // `r6` = the scalar (τ,κ) complementarity RHS `σμ − τκ [− Δτ_a·Δκ_a]`.
+        let hsd_dir = |r_c_arg: &SVector<f64, NCT>, r6: f64| {
+            // Residual RHS of the core system:
+            //   bx_res = −R_x + Gᵀ·W·r_c_arg − Gᵀ·W²·R_g ; ba_res = −R_λ.
+            let bx_res = -r_x + g_t * (w * r_c_arg) - g_t * (w2 * r_g);
+            let ba_res = -r_a;
+            let (dx_r, dl_r) = nt_schur_apply(prob, &fac, &bx_res, &ba_res);
+            // Gap-row scalar equation:  const + coef·Δτ = −R_t.
+            let const_lhs = d.dot(&dx_r) + prob.b.dot(&dl_r)
+                - prob.h.dot(&(w * r_c_arg)) + prob.h.dot(&(w2 * r_g))
+                + r6 / tau;
+            let dtau = (-r_t - const_lhs) / coef;
+            let dx   = dx_r + dx_t * dtau;
+            let dl   = dl_r + dl_t * dtau;
+            // Δs = −R_g − G·Δx + h·Δτ ;  Δz = −W·r_c_arg − W²·Δs ;
+            // Δκ = (r6 − κ·Δτ)/τ.
+            let ds   = -r_g - prob.g_mat * dx + prob.h * dtau;
+            let dz   = -(w * r_c_arg) - w2 * ds;
+            let dkap = (r6 - kappa * dtau) / tau;
+            (dx, dl, ds, dz, dtau, dkap)
+        };
+
+        // Fraction-to-boundary of a full direction over (s, z, τ, κ).
+        let ftb = |ds: &SVector<f64, NCT>, dz: &SVector<f64, NCT>, dt: f64, dk: f64| -> f64 {
+            let a_s = max_step_all_cones(&se, ds, &prob.cones);
+            let a_z = max_step_all_cones(&ze, dz, &prob.cones);
+            let a_t = if dt < 0.0 { -tau   / dt } else { f64::INFINITY };
+            let a_k = if dk < 0.0 { -kappa / dk } else { f64::INFINITY };
+            a_s.min(a_z).min(a_t).min(a_k)
+        };
+
+        // ---- Affine (predictor): σ = 0, r_c_arg = s̃, r6 = −τκ ----
+        // Only the affine (s,z,τ,κ) directions are needed (for σ and the
+        // corrector's second-order term); the affine x/λ are recomputed by the
+        // corrector, so they are bound to `_`.
+        let (_dx_a, _dl_a, ds_a, dz_a, dtau_a, dkap_a) = hsd_dir(&fac.s_scaled, -tau * kappa);
+        let aff_finite = ds_a.iter().all(|v| v.is_finite())
+            && dz_a.iter().all(|v| v.is_finite())
+            && dtau_a.is_finite() && dkap_a.is_finite();
+        if !aff_finite {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter + 1);
+        }
+        let alpha_a = clip01(BACKOFF * ftb(&ds_a, &dz_a, dtau_a, dkap_a));
+
+        // Mehrotra centering σ = (μ_aff/μ)³ (the gap the affine step would reach).
+        let s_aff   = se    + ds_a   * alpha_a;
+        let z_aff   = ze    + dz_a   * alpha_a;
+        let tau_aff = tau   + dtau_a * alpha_a;
+        let kap_aff = kappa + dkap_a * alpha_a;
+        let mu_aff  = (s_aff.dot(&z_aff) + tau_aff * kap_aff) / degree;
+        let sigma = if mu > 1.0e-300 {
+            let r  = mu_aff / mu;
+            let s3 = r * r * r;
+            if s3.is_finite() { s3.clamp(0.0, 1.0) } else { 0.5 }
+        } else {
+            0.0
+        };
+
+        // ---- Corrector r_c_arg = s̃ + arrow(s̃)⁻¹·(Δs̃_a∘Δz̃_a) − σμ·s̃⁻¹ ----
+        // Scaled affine directions: Δs̃_a = W·Δs_a, Δz̃_a = −s̃ − Δs̃_a (the
+        // W⁻¹-free identity the plain NT corrector uses).
+        let ds_a_scaled = w * ds_a;
+        let dz_a_scaled = -fac.s_scaled - ds_a_scaled;
+        let mut second_order = SVector::<f64, NCT>::zeros();
+        jordan_per_cone(&ds_a_scaled, &dz_a_scaled, &prob.cones, &mut second_order);
+        let arrow_s_inv_second = fac.arrow_s_scaled_inv * second_order;
+        let s_scaled_inv       = fac.arrow_s_scaled_inv * e_vec;   // arrow(s̃)⁻¹·e = s̃⁻¹
+        let r_c_arg_corr = fac.s_scaled + arrow_s_inv_second - s_scaled_inv * (sigma * mu);
+        // Scalar (τ,κ) corrector RHS: σμ − τκ − Δτ_a·Δκ_a.
+        let r6_corr = sigma * mu - tau * kappa - dtau_a * dkap_a;
+
+        let (dx, dl, ds, dz, dtau, dkap) = hsd_dir(&r_c_arg_corr, r6_corr);
+        let step_finite = dx.iter().all(|v| v.is_finite())
+            && dl.iter().all(|v| v.is_finite())
+            && ds.iter().all(|v| v.is_finite())
+            && dz.iter().all(|v| v.is_finite())
+            && dtau.is_finite() && dkap.is_finite();
+        if !step_finite {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter + 1);
+        }
+
+        // ---- Single self-dual step length (one α for the whole direction) ----
+        let raw   = ftb(&ds, &dz, dtau, dkap);
+        let alpha = clip01(BACKOFF * raw);
+        // `clip01` returns a finite value in `[0, 1]`, so `<= 0` is exactly the
+        // "no interior step available" case (NaN already mapped to 0 there).
+        if alpha <= 0.0 {
+            // No interior progress possible — return the best snapshot if any.
+            return numerical_exit(ws, IpmStatus::BestFeasible, iter + 1);
+        }
+
+        // ---- Apply ----
+        xe    += dx   * alpha;
+        le    += dl   * alpha;
+        se    += ds   * alpha;
+        ze    += dz   * alpha;
+        tau   += dtau * alpha;
+        kappa += dkap * alpha;
+
+        // `τ`/`κ` are finite here (the corrector direction passed `step_finite`
+        // and `alpha` is finite), so `<= 0` catches a non-positive overshoot;
+        // any residual non-finite is caught by the `max_abs` gate just below.
+        if !all_cones_interior(&se, &prob.cones)
+            || !all_cones_interior(&ze, &prob.cones)
+            || tau <= 0.0 || kappa <= 0.0
+        {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter + 1);
+        }
+        let max_abs = xe.amax().max(se.amax()).max(ze.amax()).max(le.amax())
+            .max(tau.abs()).max(kappa.abs());
+        if !max_abs.is_finite() || max_abs > 1.0e50 {
+            return numerical_exit(ws, IpmStatus::NumericalError, iter + 1);
+        }
+    }
+
+    // Hard iter cap. Prefer the best snapshot; else the live recovered iterate
+    // (already in `ws.x/...`) scrubbed for NaN-safety by `numerical_exit`.
+    if ws.best_valid {
+        SocpResult {
+            x: ws.best_x, lambda: ws.best_lambda,
+            s: ws.best_s, y: ws.best_y,
+            status: IpmStatus::BestFeasible,
+            iters:  params.max_iters.min(IPM_HARD_MAX_ITERS),
+        }
+    } else {
+        numerical_exit(ws, IpmStatus::IterCap, params.max_iters.min(IPM_HARD_MAX_ITERS))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1747,5 +2115,101 @@ mod tests {
         assert_eq!(result.iters, 0);
         // No best-feasible iterate seen ⇒ IterCap, not BestFeasible.
         assert!(result.status == IpmStatus::IterCap);
+    }
+
+    /// **HSD-direction regression** — the same 2-cone problem
+    /// (`two_cone_mixed_socp` / `nt_solves_two_cone_problem`) must be solved by
+    /// the homogeneous-self-dual driver `solve_socp_hsd` to the same precision.
+    /// HSD cold-starts from the central point (ignores the warm-start), so this
+    /// also exercises the de-homogenization (`recover = embedded/τ`). Expected
+    /// `x = (1, 1, 2)`, `s[3] → 0` (cone 2 binding), `y[3] → 1`.
+    #[test]
+    fn hsd_solves_two_cone_problem() {
+        const NP: usize     = 3;
+        const NE: usize     = 2;
+        const NCT: usize    = 4;
+        const NCONES: usize = 2;
+
+        let prob = SocpProblem::<NP, NE, NCT, NCONES> {
+            c:     SVector::<f64, 3>::from_column_slice(&[0.0, 0.0, 1.0]),
+            a_mat: SMatrix::<f64, 2, 3>::from_row_slice(&[
+                1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+            ]),
+            b:     SVector::<f64, 2>::from_column_slice(&[1.0, 1.0]),
+            g_mat: SMatrix::<f64, 4, 3>::from_row_slice(&[
+                 0.0,  0.0, -1.0,
+                -1.0,  0.0,  0.0,
+                 0.0, -1.0,  0.0,
+                 0.0,  0.0, -1.0,
+            ]),
+            h:     SVector::<f64, 4>::from_column_slice(&[0.0, 0.0, 0.0, -2.0]),
+            cones: [
+                ConeDesc { offset: 0, dim: 3 },
+                ConeDesc { offset: 3, dim: 1 },
+            ],
+        };
+
+        let mut ws = SocpWorkspace::<NP, NE, NCT>::default();
+        let params = IpmAlgoParams::default();
+        let result = solve_socp_hsd(&prob, &params, &mut ws);
+
+        eprintln!("HSD 2-cone: status = {}, iters = {}, x = ({:.6}, {:.6}, {:.6})",
+                  result.status.as_u32(), result.iters,
+                  result.x[0], result.x[1], result.x[2]);
+
+        assert!(matches!(
+            result.status,
+            IpmStatus::Optimal | IpmStatus::BestFeasible
+        ), "HSD failed: status = {}", result.status.as_u32());
+
+        let expected = [1.0, 1.0, 2.0];
+        for (i, &want) in expected.iter().enumerate() {
+            assert!(
+                (result.x[i] - want).abs() < 1.0e-4,
+                "x[{i}] = {} vs {} (status {})", result.x[i], want, result.status.as_u32()
+            );
+        }
+        assert!(result.s[3] < 1.0e-3, "s[3] = {}", result.s[3]);
+        assert!((result.y[3] - 1.0).abs() < 1.0e-3, "y[3] = {}", result.y[3]);
+    }
+
+    /// **HSD toy SOCP** — `min x_1 s.t. x_2+x_3=1, x ∈ SOC^3`. The optimum
+    /// `x = (√0.5, 0.5, 0.5)` sits EXACTLY on the cone boundary (`det(x)=0`) —
+    /// the vanishing-cone scenario in miniature, where AHO degenerates and the
+    /// plain NT scaling overflows. HSD must still recover it (the central-path
+    /// embedding keeps the NT scaling bounded).
+    #[test]
+    fn hsd_toy_socp_recovers_closed_form() {
+        const NP: usize     = 3;
+        const NE: usize     = 1;
+        const NCT: usize    = 3;
+        const NCONES: usize = 1;
+
+        let prob = SocpProblem::<NP, NE, NCT, NCONES> {
+            c:     SVector::<f64, 3>::from_column_slice(&[1.0, 0.0, 0.0]),
+            a_mat: SMatrix::<f64, 1, 3>::from_row_slice(&[0.0, 1.0, 1.0]),
+            b:     SVector::<f64, 1>::from_element(1.0),
+            g_mat: -SMatrix::<f64, 3, 3>::identity(),
+            h:     SVector::<f64, 3>::zeros(),
+            cones: [ConeDesc { offset: 0, dim: 3 }],
+        };
+        let mut ws = SocpWorkspace::<NP, NE, NCT>::default();
+        let params = IpmAlgoParams::default();
+        let result = solve_socp_hsd(&prob, &params, &mut ws);
+
+        eprintln!("HSD toy SOCP: status = {}, iters = {}, x = ({:.6}, {:.6}, {:.6})",
+                  result.status.as_u32(), result.iters,
+                  result.x[0], result.x[1], result.x[2]);
+
+        let expected_x = [sqrt(0.5), 0.5, 0.5];
+        for (i, &expected) in expected_x.iter().enumerate() {
+            assert!(
+                (result.x[i] - expected).abs() < 1.0e-3,
+                "x[{i}] = {} vs {} (status {})",
+                result.x[i], expected, result.status.as_u32()
+            );
+        }
+        assert!((result.x[1] + result.x[2] - 1.0).abs() < 1.0e-3);
     }
 }

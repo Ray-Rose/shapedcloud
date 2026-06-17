@@ -1,5 +1,9 @@
 # shapedcloud — SCvx powered-descent trajectory solver
 
+[![CI](https://github.com/Ray-Rose/shapedcloud/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Ray-Rose/shapedcloud/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
+
 A **Successive-Convexification (SCvx)** trajectory-optimization solver for
 **3-DoF powered descent** (rocket / lander guidance), written as **flight-grade,
 `no_std` Rust**. The engineering discipline is the point: static memory, no heap,
@@ -57,6 +61,14 @@ library and a `no_std` bare-metal static library.
   Julia/Clarabel oracles) but **diverges on flight-scale subproblems** where the
   relaxation cones vanish at the optimum — a documented limit of symmetric NT
   scaling, not a bug. `HANDOFF.md` records the full investigation.
+- A **homogeneous self-dual (HSD) embedded** direction (`solve_socp_hsd`)
+  **cracks that NT limit** — the production-solver approach (ECOS/Clarabel). On
+  the *same* flight-scale subproblem where plain NT diverges (duality gap → 1e13),
+  HSD converges to the external CVXPY/Clarabel + Julia optimum to **~1e-7 relative
+  cost in 15 iterations** — tighter *and* faster than even AHO, and it converges
+  on cases where AHO itself fails. It is a verified inner solver (not yet wired
+  into the SCvx outer loop, and the O(N) structured version is the next lift); see
+  `HANDOFF.md` "Phase 26".
 - A **block-tridiagonal Schur** primitive provides an O(N) inner solve
   (per-step machine-precision-equivalent to dense).
 

@@ -95,6 +95,15 @@ a context-window roll-over so the next session starts coherent.
 
 - **Genuinely-open future work** (extensions, not gaps — nothing blocks
   flight-readiness):
+
+  > **UPDATE — item 1 is CRACKED (Phase 26).** A homogeneous self-dual (HSD)
+  > embedded driver (`scvx_ipm::solve_socp_hsd`) CONVERGES on the flight-scale
+  > subproblem to the external CVXPY/Clarabel + Julia optimum (rel-cost ~8.5e-8,
+  > bounded gap) where plain NT diverges (gap → 1e13) — tighter and faster than
+  > even AHO. See the "Phase 26" section below. The historical item-1 narrative is
+  > kept for context; the remaining work is now **outer-loop integration** + the
+  > **O(N) structured HSD**, not NT convergence itself.
+
   1. **NT convergence on flight-scale subproblems** (Phase 8 — bottleneck
      re-diagnosed; the matrix-sqrt is NOT it). **The per-D Higham-scaled
      matrix-sqrt is already implemented** — `socp.rs::emit_nt_w_specialized!`
@@ -1474,10 +1483,145 @@ parity). 132 tests pass (Linux), clippy clean.
 
 ---
 
+## Phase 26 — HSD embedding: the NT/O(N) frontier CRACKED (LANDED)
+
+The Phase-25 conclusion was explicit: the three incremental NT levers (exact
+per-cone scaling, per-cone/wide-neighborhood centering, iterative refinement) are
+measured-exhausted, and "genuinely advancing NT now requires a **different
+framework** (e.g., a homogeneous self-dual embedding / Mehrotra-on-HSD) — a large
+research effort essentially equivalent to a new solver." **This phase builds that
+solver, and it works.**
+
+### What landed
+
+A complete **homogeneous self-dual (HSD) embedded** Mehrotra predictor-corrector
+IPM — `scvx_ipm::solve_socp_hsd` (in `socp.rs`), the production-solver approach
+(ECOS, Clarabel). It embeds the standard-form primal-dual pair into one
+skew-symmetric self-dual system with two extra scalars — `τ` (homogenizing) and
+`κ` (its complementary slack):
+```text
+  Aᵀλ + Gᵀz + cτ        = 0      (dual feasibility, homogenized)
+  Ax            − bτ    = 0      (primal-equality feasibility)
+  Gx + s        − hτ    = 0      (primal-cone feasibility)
+  cᵀx + bᵀλ + hᵀz + κ   = 0      (the self-dual gap row)
+  s ∘ z = μ e ,   τ κ = μ ,   s,z ∈ K, τ,κ ≥ 0
+```
+and path-follows the EMBEDDED central path. The recovered original solution is
+`(x,λ,s,z)/τ` at `μ→0` (or a `τ→0` primal/dual infeasibility certificate).
+
+- **Why it cracks the vanishing cone.** Plain NT diverges because the SCvx
+  virtual-control SOC^8 cones vanish at the optimum, the iterates drift OFF the
+  central path (per-cone complementarity spans ~10^11), and `H = GᵀW²G` becomes
+  catastrophically ill-conditioned (Phases 15/22/25). The HSD embedding keeps
+  EVERY cone — and the `(τ,κ)` ray — at ONE shared `μ`, i.e. near-complementary
+  (`s∘z ≈ μe`), which is EXACTLY the regime where the already-implemented
+  `soc_nt_scaling_exact` is provably bounded (`s̄≈z̄ ⇒ w̄≈e ⇒ W≈η·I`) even as
+  `det→0`. The W²-spread that destroys plain NT never forms.
+- **Reuses the audited NT machinery.** The `τ`-coupling makes the Newton system
+  non-separable; eliminating `Δs` (cone-feasibility) and `Δz` (the SAME
+  `Δz = −W·r_c_arg − W²·Δs` relation the plain NT driver uses) leaves a
+  `(Δx,Δλ)` system AFFINE in the scalar `Δτ`. Solved by the standard two-RHS +
+  scalar-`Δτ` reduction: two applies of the SAME `build_step_factors_nt` H/S
+  Schur factor (the residual RHS + the constant `[c;b;h]` τ-column → `(Δx_r,Δλ_r)`,
+  `(Δx_t,Δλ_t)`), then one scalar gap-row equation for `Δτ`, then back-substitute
+  `Δx,Δλ,Δs,Δz,Δκ`. So HSD is a thin (~250-line) driver on the existing,
+  machine-precision-verified NT factor — no new linear-algebra primitive.
+- **Cold-starts central** (`x=0, λ=0, s=z=e, τ=κ=1`) — HSD needs no feasible
+  warm-start, an inherent advantage over the warm-started AHO/NT drivers.
+
+### Measured (the result — honest)
+
+On the **real assembled flight-scale SCvx subproblem** (`oracle_scvx_subproblem`
+fixtures — the 57/58-var, 24/26-cone problem the production loop hands the inner
+IPM, full preconditioning), HSD vs the external CVXPY/Clarabel + Julia oracle, vs
+AHO (production default) and plain NT (`diag_nt_on_flight_subproblem`):
+
+| alt (m) | plain NT          | AHO (default)                 | **HSD**                              |
+|---------|-------------------|-------------------------------|--------------------------------------|
+| 2   | diverges, gap 1.2e13 | **fails** (NumericalError)    | converges, gap 1.1e-2                |
+| 10  | diverges, gap 2.8e12 | gap 9.6e4                     | converges, gap 8.8e-2                |
+| 50  | diverges, gap 1.5e4  | gap 7.6e2                     | converges, gap 2.3e-3                |
+| 100 | diverges, gap 3.5e14 | rel-cost 5e-4, gap 84, 60 it  | **rel-cost 8.5e-8, gap 5.4e-4, 15 it** |
+
+- **HSD converges on EVERY altitude; plain NT diverges on every one** (NT:
+  `|Ax−b|` grows to 9–29, gap explodes to 1e12–1e14). HSD's duality gap stays
+  BOUNDED (≤ ~1) — 12–14 orders below NT.
+- At alt=100 (baked oracle `2.176946359299e6`), **HSD matches to relative cost
+  8.5e-8 in 15 iterations** — ~4 orders MORE accurate than AHO's 5e-4 and 4×
+  faster (AHO needs 60). Free-tf: HSD rel-cost 9.3e-5 (AHO 7.6e-3).
+- **HSD converges where AHO itself FAILS** (alt=2: AHO → NumericalError; HSD →
+  clean feasible solution). HSD's gap is 5–6 orders tighter than AHO at every alt.
+
+### The one real subtlety (diagnosed + fixed)
+
+Initially HSD reached the optimum (~iter 20, rel-cost 1e-7) then OVERSHOT and
+broke down by iter ~30: with no endgame guard it kept stepping past the solution
+into the `(τ,κ)→0` region where the scaling re-conditions badly and `τ` collapses
+(the recovered `x/τ` blows up). Fixed with the standard endgame guard the AHO/NT
+drivers already use — snapshot the best primal-feasible-and-small-gap iterate and
+exit once it is tight (`μ < loose_mu`) OR the live gap regresses past 4× the best
+(overshoot detected). The snapshot is keyed on primal feasibility + `μ`, NOT the
+dual residual: with `virt_weight ~ 1e5` the recovered dual residual's absolute
+floor sits above the loose tolerance even at the optimum (`μ` + primal feasibility
++ `τ>0` already certify near-optimality in the self-dual embedding). The
+`diag_hsd_iter_sweep_alt100` trace shows the before/after cleanly.
+
+### Tests (+4 passing, +1 ignored diagnostic)
+
+- `socp.rs`: `hsd_solves_two_cone_problem` (`Optimal`, exact `x=(1,1,2)` in 6 it)
+  and `hsd_toy_socp_recovers_closed_form` (boundary optimum `(√0.5,0.5,0.5)` — the
+  vanishing-cone case in miniature, where AHO degenerates and plain NT overflows).
+- `oracle_diff.rs`: HSD added to all 3 toy CVXPY/Clarabel + Julia gates — full
+  KKT-optimality (`compl`, dual-stationarity, primal feasibility < 1e-3) on the
+  well-conditioned toys, mirroring the AHO/NT checks (no new test fns).
+- `oracle_scvx_subproblem.rs`: `rust_hsd_matches_external_oracle_scvx_fixedtf`
+  (rel-cost < 1e-5, bounded gap < 10) and `_freetf` (rel-cost < 1e-2) — the gates
+  plain NT could NEVER pass. Plus `diag_hsd_iter_sweep_alt100` (ignored) and HSD
+  wired into `diag_nt_on_flight_subproblem`.
+
+### Honest scope (what is and is NOT done)
+
+- **Done**: HSD is a verified, panic-free, no_std, bounded-WCET inner SOCP solver
+  that CONVERGES on the flight-scale subproblem to the external oracle, decisively
+  beating both plain NT (diverges) and AHO (looser/slower/fails). The NT
+  convergence frontier (open item #1, the deepest open problem since Phase 8) is
+  **cracked at the subproblem level.**
+- **NOT yet done** (the genuine next steps, now UNBLOCKED):
+  1. **Wire HSD into the SCvx outer loop** (`solve_scvx` dispatch + a `use_hsd`
+     knob) so end-to-end powered-descent runs on the HSD inner solve. The
+     subproblem-level win is proven; the outer-loop integration + warm-start
+     strategy (HSD currently cold-starts central each call) is the remaining
+     engineering.
+  2. **The O(N) structured HSD** — the dense HSD is `O((N·NZ)³)`. The O(N) lift
+     ports the embedded Newton solve to the block-tridiagonal Schur
+     (`reduced_kkt`). Crucially, HSD UNBLOCKS this: the structured-NT path was
+     blocked by NT's vanishing-cone ill-conditioning (the same root cause), which
+     HSD removes — so the structured factorization should now be stable. This is
+     where NT and O(N) finally close TOGETHER.
+  3. HSD returns **BestFeasible** (the endgame guard exits before machine-zero
+     `μ`), not a formal `Optimal` — but the 8.5e-8 oracle-cost match IS the
+     convergence proof. A polished `Optimal`/infeasibility-certificate path is
+     the ECOS/Clarabel-grade finish.
+
+**Recommendation: AHO remains the shipping production default** (HSD is new, not
+yet outer-loop-integrated, and not yet re-audited at the depth AHO has). **HSD is
+the validated path that cracks the NT/O(N) frontier** and is the foundation for
+the O(N) structured solve. Plain NT stays the documented negative result; the
+opt-in `use_nt_scaling` is unchanged.
+
+---
+
 ## Final state summary
 
 ```
-Tests:      132 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      136 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (132 → 136: Phase 26 added +2 HSD toy-SOCP tests (scvx-ipm) and +2
+                              HSD external-oracle flight-subproblem gates — the
+                              homogeneous self-dual driver that CONVERGES (to the
+                              oracle, rel-cost ~8.5e-8) where plain NT DIVERGES.
+                              HSD was also added in-place to the 3 oracle_diff toy
+                              gates, and the scvx red-team test got +2 trust-param
+                              validation attacks (no new fn))
               (127 → 129 → 132: Phase 21 added +2 external-oracle flight-subproblem
                               tests — AHO vs CVXPY/Clarabel + Julia on the real
                               57/58-var assembled SCvx SOCP; Phase 22 added +3
