@@ -1,5 +1,5 @@
 using Pkg
-Pkg.activate(".")
+Pkg.activate(@__DIR__)  # this script's env, NOT the cwd — so it works from repo root
 using JuMP, Clarabel
 
 # Same three canonical problems as solve_canonical.py.

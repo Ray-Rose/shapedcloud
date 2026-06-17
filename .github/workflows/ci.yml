@@ -1,0 +1,52 @@
+name: CI
+
+# Verification matrix for the flight-grade SCvx solver. Pinned to the project's
+# MSRV (Rust 1.94, see Cargo.toml `rust-version`) so the clippy lint set is
+# reproducible and matches local verification — a newer stable could introduce
+# new lints that fail `-D warnings` for reasons unrelated to the code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: test · clippy · cross-compile · example
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94 (MSRV) + clippy + thumb target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy
+          targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      - name: Example — mars_descent (soft-landing / determinism)
+        run: cargo run --release --example mars_descent
+
+      - name: Cross-compile — no_std solver core (thumbv7em-none-eabihf)
+        run: cargo build --release --target thumbv7em-none-eabihf -p scvx-solver
+
+      - name: Cross-compile — no_std C-FFI (thumbv7em, panic-handler)
+        run: cargo build --release -p scvx-ffi --no-default-features --features panic-handler --target thumbv7em-none-eabihf
+
+      - name: Build — host C-FFI (.so / .a / .rlib)
+        run: cargo build --release -p scvx-ffi

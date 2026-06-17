@@ -217,8 +217,9 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --target thumbv7em-none-eabihf
 ```
 
-Expected: 120 tests pass (split as `0+17+43+44+5+3+8+0+0+0+0+...`
-= core 0, dynamics 17, ipm 43, solver-lib 44, ffi 5, oracle 3, wcet 8;
+Expected: 132 tests pass (split as `0+17+46+48+3+2+8+8`
+= core 0, dynamics 17, ipm 46, solver-lib 48, oracle_diff 3,
+oracle_scvx_subproblem 2, wcet 8, ffi 8;
 **note**: a Windows Application Control / Defender policy sometimes
 transiently blocks a freshly-recompiled debug test binary (`os error
 4551`); if `cargo test` aborts mid-run with "An Application Control
@@ -1376,6 +1377,51 @@ Fixes applied (all honesty / completeness — no behavior change on valid input)
 - **Validation completeness.** `cos_theta_max` is now bounded to `[0, 1]` (a
   cosine `> 1` has no real angle; `= 0` ⇒ 90° pointing is a valid degenerate
   config), and a stale contradictory FFI comment was reconciled.
+
+---
+
+## Phase 24 — post-interruption deep re-audit + CI (LANDED)
+
+A recovery / re-grounding pass after a service interruption, then a fresh
+**5-agent line-by-line audit of EVERY file** (Phase 20-23 changes, cross-crate
+integration, and doc-truth in focus — heading toward a public release). **Git
+integrity clean** (no half-applied edits). All math **independently re-verified**
+(exact NT scaling re-derived in Python; both dynamics Jacobians + the FOH/RK4
+τ-sensitivity ODE; block-tridiag / Sherman-Morrison; all 8 cone rows; header↔Rust
+ABI parity; Python↔Julia↔Rust oracle identity reproduced). All flight invariants
+hold; **no unfinished/half-applied code; pre-public secret/path scan clean.**
+
+> **WDAC note**: native EXECUTION of the freshly-built `scvx_solver` test binary
+> is intermittently blocked by Windows Application Control (`os error 4551`) — it
+> drops that suite from the count (71/132) but is **not** a regression. Verify on
+> Linux: **WSL2** (`CARGO_TARGET_DIR=$HOME/...`) or the Docker clean-room. WSL2
+> gives the full **132 pass** + deterministic `4.3699e3`, matching Windows.
+
+Fixes (1 MEDIUM, 9 LOW — none a flight-path correctness/safety defect):
+- **MEDIUM — structured-NT scaling parity.** Phase 22 upgraded the DENSE NT path
+  to `soc_nt_scaling_exact` but left the STRUCTURED NT driver
+  (`build_per_cone_nt_blocks`) on the old geometric-mean form — a silent
+  primitive divergence that re-introduced the `arrow(s)⁻¹ᐟ²` overflow on the
+  structured path. Routed it through `soc_nt_scaling_exact` (geomean fallback),
+  mirroring the dense path; the structured-NT one-iter equivalence tests now
+  match at machine precision. (Matters for the upcoming NT/O(N) frontier.)
+- **Validation completeness** (`solve_scvx`): rejects a NaN/negative `t_min`, a
+  NaN/`≤ t_min` `t_max` (the only phys params that escaped the `BadInput`
+  contract; +2 red-team attacks), and `N == 0` (a release-mode OOB the
+  `debug_assert` missed).
+- **Doc-truth (pre-public accuracy):** `continuous.rs` thrust-eps "Smaller"→
+  "Larger" (it is 100× larger); `socp.rs` `regularization` docstring cites
+  `rel_factor`; HANDOFF quick-verify 120→132 + corrected split;
+  `jl-oracle/solve_canonical.jl` `Pkg.activate(".")`→`@__DIR__` (the documented
+  invocation was broken); FFI header + `INTEGRATION.md` corrected (BadInput /
+  NullPointer leave the output buffer **unmodified**, not "a seeded reference" /
+  "always finite"); `INTEGRATION.md` §5.1 now documents the
+  `rho`/`cd_a`/`cos_theta_max`/`tan_gamma_gs` constraints; `mars_descent`
+  dangling test-name reference fixed.
+- **CI added** — `.github/workflows/ci.yml` (pinned to the MSRV 1.94) runs
+  clippy `-D warnings` + the 132-test workspace + the deterministic example +
+  the thumb `no_std` (solver + FFI) and host FFI builds on every push / PR. The
+  repo is now self-verifying.
 
 ---
 

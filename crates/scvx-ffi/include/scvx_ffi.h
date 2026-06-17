@@ -232,9 +232,12 @@ ScvxStatus scvx_options_default(COptions* options);
  *    `options->use_free_tf == 0`; `scvx_solve_nN_free_tf` needs
  *    `options->use_free_tf != 0`. A mismatch returns SCVX_STATUS_BAD_INPUT
  *    (it would otherwise index past the workspace).
- *  - On return `*out_trajectory` holds the best trajectory found (possibly
- *    not fully converged). ALWAYS check the returned status before using it
- *    as a flight plan.
+ *  - When the solver ran (status Converged / OuterIterCap / InnerFailure /
+ *    Infeasible), `*out_trajectory` holds the best trajectory found (possibly
+ *    not fully converged) and finite. On BadInput / NullPointer the function
+ *    returns BEFORE writing, so the buffer is left UNMODIFIED (caller's bytes)
+ *    — do not read it. ALWAYS check the returned status before using the
+ *    trajectory as a flight plan.
  *
  * Convergence is validated for N <= 5 (see the scvx-solver test suite).
  * Larger N is best-effort: the entrypoint always returns a status (commonly

@@ -167,10 +167,10 @@ workspace). This is enforced at the boundary *and* inside the solver.
 | `g0`            | Reference gravity for Isp (m/s², ~9.80665)           | finite, `> 0`                 |
 | `t_min`         | Min thrust (N)                                       | finite, `>= 0`                |
 | `t_max`         | Max thrust (N)                                       | finite, `> t_min`             |
-| `cos_theta_max` | Cosine of max thrust-pointing angle                  | (model input)                 |
-| `tan_gamma_gs`  | Tangent of glide-slope cone half-angle               | (model input)                 |
-| `rho`           | Atmospheric density for drag (0 disables drag)       | (model input)                 |
-| `cd_a`          | Drag coefficient × area                              | (model input)                 |
+| `cos_theta_max` | Cosine of max thrust-pointing angle                  | finite, `∈ [0, 1]`            |
+| `tan_gamma_gs`  | Tangent of glide-slope cone half-angle               | finite, `>= 0`                |
+| `rho`           | Atmospheric density for drag (0 disables drag)       | finite, `>= 0`                |
+| `cd_a`          | Drag coefficient × area                              | finite, `>= 0`                |
 | `tau_lo`        | Min time-of-flight (s) — free-tf only                | free-tf: finite, `> 0`        |
 | `tau_hi`        | Max time-of-flight (s) — free-tf only                | free-tf: finite, `> tau_lo`   |
 
@@ -234,13 +234,15 @@ Validation scope (be precise here):
 | `1`   | `SCVX_STATUS_OUTER_ITER_CAP` | Hit the outer-iteration cap. Best-found trajectory returned; may be usable but did not meet the convergence test. |
 | `2`   | `SCVX_STATUS_INNER_FAILURE`  | An inner SOCP subproblem failed. Trajectory is stale-but-finite; do **not** use as a plan. |
 | `3`   | `SCVX_STATUS_INFEASIBLE`     | Problem detected infeasible.                                   |
-| `4`   | `SCVX_STATUS_BAD_INPUT`      | An input/contract was violated (see §3–§5). No SCvx iteration ran; the output buffer holds only a seeded reference — do not use it. |
+| `4`   | `SCVX_STATUS_BAD_INPUT`      | An input/contract was violated (see §3–§5). No SCvx iteration ran; the function returns before writing, so the output buffer is left UNMODIFIED (caller's bytes) — do not read it. |
 | `255` | `SCVX_STATUS_NULL_POINTER`   | A pointer argument was NULL.                                   |
 
 Only `CONVERGED` (and, with mission-specific care, `OUTER_ITER_CAP`) should be
-treated as a usable plan. The output trajectory is **always finite** on return
-regardless of status (no NaN/Inf leaks across the boundary), so it is safe to
-read/log — but its *meaning* is only guaranteed when `CONVERGED`.
+treated as a usable plan. When the solver ran (`CONVERGED` / `OUTER_ITER_CAP` /
+`INNER_FAILURE` / `INFEASIBLE`) the output trajectory is **finite** (no NaN/Inf
+leaks across the boundary), so it is safe to read/log — but its *meaning* is
+only guaranteed when `CONVERGED`. On `BAD_INPUT` / `NULL_POINTER` the function
+returns before writing, so the buffer is left **unmodified** — do not read it.
 
 ---
 

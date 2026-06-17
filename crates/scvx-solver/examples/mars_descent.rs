@@ -3,7 +3,7 @@
 //! Solves a small (N=3) Mars landing problem using the high-level
 //! [`scvx_solver::solve_powered_descent`] API and prints the resulting
 //! trajectory. (N=3 is the validated small-scale sweet spot; see
-//! `scvx_converges_larger_n_with_tuned_trust` for the larger-N path.)
+//! `scvx_converges_larger_n_adaptive_trust` for the larger-N path.)
 //!
 //! ## Problem
 //!

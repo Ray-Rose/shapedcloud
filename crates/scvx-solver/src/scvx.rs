@@ -294,7 +294,21 @@ pub fn solve_scvx<
         || !phys.cos_theta_max.is_finite()
         || phys.cos_theta_max < 0.0 || phys.cos_theta_max > 1.0
         || !phys.tan_gamma_gs.is_finite()  || phys.tan_gamma_gs  < 0.0
+        // Throttle band: `t_min` feeds the `σ ≥ T_min` cone and `t_max` the
+        // `T_max ≥ σ` cone (assemble.rs). Require `0 ≤ t_min < t_max`, finite —
+        // else those cone rows get a NaN or inverted bound. (Every other phys
+        // param is validated above; these were the gap.)
+        || !phys.t_min.is_finite() || phys.t_min < 0.0
+        || !phys.t_max.is_finite() || phys.t_max <= phys.t_min
     {
+        return SolverStatus::BadInput;
+    }
+
+    // `N = 0` is a degenerate compile-time layout (NP = 0): the assembler would
+    // write the 7 initial-state rows into an `NE = 6` matrix in release (where
+    // `assemble.rs`'s `debug_assert!(N >= 1)` is compiled out) — an out-of-bounds
+    // panic. Reject explicitly so the no-panic contract holds in release too.
+    if N == 0 {
         return SolverStatus::BadInput;
     }
 
@@ -1190,6 +1204,24 @@ mod tests {
                 solve_scvx(&mut ws, &phys, &algo_neg_eta, &ipm, &x_init, &term),
                 SolverStatus::BadInput
             ));
+
+            // Attack 7: NaN thrust ceiling (`t_max` feeds the `T_max ≥ σ` cone).
+            let mut phys_nan_tmax = mars_params();
+            phys_nan_tmax.t_max = f64::NAN;
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = fresh_ws();
+            assert!(matches!(
+                solve_scvx(&mut ws, &phys_nan_tmax, &algo, &ipm, &x_init, &term),
+                SolverStatus::BadInput
+            ), "NaN t_max should yield BadInput");
+
+            // Attack 8: inverted throttle band (`t_max < t_min`).
+            let mut phys_inverted = mars_params();
+            phys_inverted.t_max = phys_inverted.t_min - 1.0;
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = fresh_ws();
+            assert!(matches!(
+                solve_scvx(&mut ws, &phys_inverted, &algo, &ipm, &x_init, &term),
+                SolverStatus::BadInput
+            ), "t_max < t_min should yield BadInput");
         });
     }
 

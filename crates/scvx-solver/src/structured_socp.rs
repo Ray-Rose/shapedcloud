@@ -56,8 +56,8 @@ use nalgebra::{SMatrix, SVector};
 use scvx_core::{IpmAlgoParams, IpmStatus};
 use scvx_ipm::{
     soc_arrow_matrix, soc_in_interior, soc_jordan_product, soc_max_step,
-    soc_nt_w_and_inverse, ConeDesc, SocpProblem, SocpResult, SocpWorkspace,
-    IPM_HARD_MAX_ITERS,
+    soc_nt_scaling_exact, soc_nt_w_and_inverse, ConeDesc, SocpProblem, SocpResult,
+    SocpWorkspace, IPM_HARD_MAX_ITERS,
 };
 
 use crate::assemble::{NX, N_VARS_PER_NODE_SCVX};
@@ -275,19 +275,15 @@ fn build_per_cone_arrow_blocks<const NCT: usize, const NCONES: usize>(
 /// - `arrow_s_scaled_inv`: `arrow(s̃)⁻¹` where `s̃ = W·s`
 /// - `s_scaled`: the scaled iterate `s̃ = W·s`
 ///
-/// Per-D dispatch over `D ∈ {1, 3, 4, 8, 11}`. Uses the public
-/// `soc_nt_w_and_inverse` (Denman-Beavers matrix-sqrt). Returns `None` if
-/// any per-cone NT computation fails (non-interior iterate, DB divergence,
-/// or singular `arrow(s̃)`) — the IPM caller bails to `numerical_exit`,
-/// and the SCvx outer loop falls back to the dense NT driver.
-///
-/// **Robustness note**: this uses plain Denman-Beavers, which is less
-/// robust near the cone boundary than the eigendecomposition-first path in
-/// `scvx_ipm::socp` (which is private, per-D macro-emitted). On hard
-/// iterates this builder returns `None` more often than the dense NT
-/// driver would — but the structured NT driver's dense-NT fallback
-/// (in `solve_scvx`) covers that, so the worst case is "no speedup on
-/// that iter," never a wrong answer.
+/// Per-D dispatch over `D ∈ {1, 3, 4, 8, 11}`. Uses the exact closed-form NT
+/// scaling `soc_nt_scaling_exact` (vanishing-cone-stable) as the PRIMARY path,
+/// with `soc_nt_w_and_inverse` (geometric-mean Denman-Beavers) as the fallback —
+/// mirroring the dense path's `build_nt_block_for_cone`, so the structured NT
+/// driver stays per-step-equivalent to the dense NT driver (and inherits its
+/// vanishing-cone stability rather than the old DB overflow-to-`None`). Returns
+/// `None` if any per-cone NT computation fails (non-interior iterate, both
+/// scalings failing, or singular `arrow(s̃)`) — the IPM caller bails to
+/// `numerical_exit`, and the SCvx outer loop falls back to the dense NT driver.
 #[allow(clippy::type_complexity)]
 fn build_per_cone_nt_blocks<const NCT: usize, const NCONES: usize>(
     s:     &SVector<f64, NCT>,
@@ -312,7 +308,11 @@ fn build_per_cone_nt_blocks<const NCT: usize, const NCONES: usize>(
                 let mut sv = SVector::<f64, $D>::zeros();
                 let mut yv = SVector::<f64, $D>::zeros();
                 for i in 0..$D { sv[i] = s[off + i]; yv[i] = y[off + i]; }
-                let (w_c, _w_inv_c) = soc_nt_w_and_inverse::<$D>(&sv, &yv)?;
+                // Exact closed-form NT scaling (primary, vanishing-cone-stable),
+                // geometric-mean Denman-Beavers as fallback — same primitive
+                // order as the dense `build_nt_block_for_cone`.
+                let (w_c, _w_inv_c) = soc_nt_scaling_exact::<$D>(&sv, &yv)
+                    .or_else(|| soc_nt_w_and_inverse::<$D>(&sv, &yv))?;
                 let w_sq_c     = w_c * w_c;
                 let s_scaled_c = w_c * sv;
                 let arrow_ss_inv_c = soc_arrow_matrix(&s_scaled_c).try_inverse()?;

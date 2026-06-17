@@ -10,8 +10,9 @@ pub const VELOCITY_SMOOTH_EPS: f64 = 1.0e-6;
 
 /// Thrust-magnitude smoothing epsilon. `‖u‖_ε = sqrt(‖u‖² + ε_u)` avoids
 /// the same non-Lipschitz issue in the mass derivative when thrust is at
-/// or near zero. Units: `N²`. Smaller than `VELOCITY_SMOOTH_EPS` because
-/// thrust magnitudes are large relative to noise.
+/// or near zero. Units: `N²`. Larger than `VELOCITY_SMOOTH_EPS` because
+/// thrust magnitudes are large relative to noise, so a larger absolute floor
+/// (in `N²`) stays negligible against real thrust.
 pub const THRUST_SMOOTH_EPS: f64 = 1.0e-4;
 
 /// Continuous-time 3-DoF powered-descent dynamics with aerodynamic drag,

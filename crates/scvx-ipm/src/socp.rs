@@ -601,8 +601,10 @@ const H_REG_RELATIVE: f64 = 1.0e-10;
 /// as the legacy hardcoded value. Existing tests / oracle diffs depend on
 /// this behavior, so it's the default.
 ///
-/// When `adaptive = true`, returns `max(H_REG_FLOOR, H_REG_RELATIVE ·
-/// tr(H)/n)`. Use this on column-preconditioned problems where `H'` has
+/// When `adaptive = true`, returns `max(H_REG_FLOOR, rel_factor · tr(H)/n)`,
+/// where `rel_factor` is the caller's `IpmAlgoParams::regularization` (default
+/// `H_REG_RELATIVE = 1e-10`; a non-finite/negative value falls back to that
+/// default). Use this on column-preconditioned problems where `H'` has
 /// huge diagonal entries (the fixed floor becomes negligible). **Do NOT**
 /// use this on unscaled problems whose IPM iterates approach the cone
 /// boundary — `tr(H)` can grow without bound there, and the adaptive
