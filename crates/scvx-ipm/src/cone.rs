@@ -8,11 +8,13 @@
 //! of the big primal/dual vectors.
 //!
 //! Const-generic matrix-form NT scaling lives below the slice primitives:
-//! `soc_arrow_matrix`, `soc_arrow_inv_sqrt`, `soc_nt_scaling_matrix`. These
-//! are usable today as building blocks; integrating the resulting symmetric
-//! `M = W⁻²` into the IPM's Newton system is the P1b lift (requires re-
-//! deriving the complementarity residual in scaled coordinates — not just
-//! swapping the scaling matrix).
+//! `soc_arrow_matrix`, `soc_arrow_inv_sqrt`, and the **load-bearing**
+//! `soc_nt_scaling_exact` (the Vandenberghe/CVXOPT normalized-point boost form).
+//! NT scaling IS integrated into the IPM Newton system: `solve_socp_nt` and the
+//! HSD drivers (`solve_socp_hsd` + the structured variants) all build `W²` per
+//! cone via `soc_nt_scaling_exact`. The earlier geometric-mean forms
+//! (`soc_nt_scaling_matrix` / `soc_w_squared` / `soc_nt_w_and_inverse`) remain as
+//! the never-taken `.or_else` fallback (see their docstrings).
 //!
 //! References for the Jordan-algebra view of SOC:
 //! - Alizadeh & Goldfarb, "Second-order cone programming", Math. Prog. 2003.
@@ -307,11 +309,18 @@ pub fn soc_arrow_inv_sqrt<const D: usize>(
 ///
 /// 1. **Symmetric PD** (the key property that fixes AHO's endgame
 ///    degeneracy and gives `H = GᵀMG` clean conditioning).
-/// 2. **Exactly** equal to the true NT scaling when `arrow(s)` and `arrow(y)`
-///    commute (i.e., `s_bar` ∥ `y_bar`).
+/// 2. **Maps `s → y` exactly when the bars align** (`s_bar ∥ y_bar`, where
+///    `arrow(s)`/`arrow(y)` commute): `M⁻¹·s = y` to machine precision. It is
+///    NOT the unique NT scaling even then — the geomean differs from the true NT
+///    automorphism ([`soc_nt_scaling_exact`]) in the transverse directions; only
+///    its action on `span{s, y}` coincides, which is all `W²·s` depends on.
 /// 3. **Approximately** the NT scaling otherwise — residual `‖M⁻¹·s − y‖`
 ///    typically `< 1e-3` for cones in practice, where `s` and `y` are
 ///    correlated through the centering condition `s∘y = μe`.
+///
+/// **Not load-bearing**: the IPM's NT path uses [`soc_nt_scaling_exact`] (the
+/// true automorphism); this geometric-mean form is only the `.or_else` fallback,
+/// never taken on interior iterates where the exact form succeeds.
 ///
 /// The strict-NT closed form for SOC with misaligned bars exists (Sturm
 /// 1999, Tütüncü-Toh-Todd 2003) but is substantially more code. The

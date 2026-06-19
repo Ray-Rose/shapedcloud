@@ -13,7 +13,8 @@ a context-window roll-over so the next session starts coherent.
   free-final-time. Static-memory, no-`std`, no-`alloc`, no-`panic`,
   bounded-WCET — "research-grade flight-shaped" per the original plan.
 - **Where**: the repository workspace root (all paths below are repo-relative)
-- **State**: **132 tests pass** across **5 crates**,
+- **State**: **144 tests pass** across **5 crates** (132 pre-HSD + 12 from the
+  HSD work, Phases 26–31 — see those sections + the final-state summary),
   `cargo clippy --all-targets -- -D warnings` clean,
   `cargo build --release --target thumbv7em-none-eabihf -p scvx-solver`
   clean (the no_std flight crates cross-compile to ARM Cortex-M), and the
@@ -226,9 +227,11 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --target thumbv7em-none-eabihf
 ```
 
-Expected: 132 tests pass (split as `0+17+46+48+3+2+8+8`
-= core 0, dynamics 17, ipm 46, solver-lib 48, oracle_diff 3,
-oracle_scvx_subproblem 2, wcet 8, ffi 8;
+Expected: 144 tests pass (split as `0+17+48+54+3+6+8+8`
+= core 0, dynamics 17, ipm 48, solver-lib 54, oracle_diff 3,
+oracle_scvx_subproblem 6, wcet 8, ffi 8; the HSD work — Phases 26–31 — added the
++2 ipm (toy HSD), +6 solver-lib (HSD end-to-end), +4 oracle_scvx (HSD oracle
+gates), plus an `#[ignore]`d HSD scaling benchmark in wcet;
 **note**: a Windows Application Control / Defender policy sometimes
 transiently blocks a freshly-recompiled debug test binary (`os error
 4551`); if `cargo test` aborts mid-run with "An Application Control
@@ -1850,10 +1853,87 @@ flip after the checklist.)
 
 ---
 
+## Phase 32 — pre-promotion deep re-audit (CRITICAL flight-safety fix) (LANDED)
+
+Before moving HSD toward the production default, a from-scratch **6-agent
+line-by-line re-audit of the ENTIRE codebase** (every `.rs` file), each agent
+re-deriving the math in Python WITHOUT trusting the in-tree tests. This was the
+right call: it surfaced a genuine **CRITICAL** flight-safety bug that all prior
+audits — and the passing test suite — missed.
+
+### CRITICAL — adaptive-trust `clamp(min, max)` panic (FIXED)
+
+`scvx.rs` computed the relaxed trust thresholds as
+`(ADAPT_*_FRAC·ceil).clamp(ADAPT_*_FLOOR, algo.rho_*)`. `f64::clamp` **PANICS when
+`min > max`**, reachable whenever a caller sets `rho_grow < ADAPT_GROW_FLOOR` (0.1)
+or `rho_shrink < ADAPT_SHRINK_FLOOR` (0.02) — both plausible aggressive-trust
+tunings — once the ρ-ceiling drops below `rho_shrink` (the NORMAL flight-scale
+relaxation regime the feature targets). Under `panic = "abort"` that is a process
+abort, defeating the no-panic flight contract. The running tests never triggered
+it (default `0.25/0.7` and the recommended `0.05/0.1` both sit at/above the
+floors), so it hid in plain sight through every prior audit.
+- **Fix**: `.max(FLOOR).min(configured)` — provably identical to the clamp when
+  `FLOOR <= configured` (every nominal config) and panic-free otherwise (returns
+  the configured value, the relaxation having no room to act). Plus input
+  validation rejecting non-finite/negative `rho_shrink`/`rho_grow` and non-finite
+  `rho_reject`/`conv_tol_x`/`conv_tol_virt` (the LOW companion finding) with
+  `BadInput`. Regression test `adaptive_trust_subfloor_rho_grow_no_panic` exercises
+  the formerly-panicking path and pins no-abort.
+
+### Everything else — verified correct to machine precision
+
+Each load-bearing kernel was independently re-derived (Python) and matched:
+- **`solve_socp_hsd`** — the FULL embedded Newton system reproduced to **2e-15**
+  (affine + corrector); the whole HSD algorithm re-run in Python converges to the
+  known optimum. AHO/NT steps reproduce their full systems likewise.
+- **`soc_nt_scaling_exact`** (the primitive ALL HSD rests on) — `W²s=y`,
+  automorphism, boundedness — to **2.3e-14** across all cone dims.
+- **Structured KKT** (block-tridiag Schur + free-tf SMW) — reproduces dense to
+  **6e-16** (incl. δτ recovery); every cone sign + dynamics row correct.
+- **Both dynamics Jacobians** — exact vs symbolic; FOH/RK4 a verified first-order
+  model. **Preconditioning** — cost-invariant + exact round-trips.
+- **Structured HSD drivers** — faithful mirrors of dense; the homogenizing-τ ×
+  free-tf-δτ orthogonality correct.
+- **FFI** — full field-by-field ABI parity with the C header; all `unsafe`
+  bounded; no panic crosses the boundary; the `use_hsd`-not-exposed gap confirmed.
+
+### Doc-truth corrections (no behavior change)
+- `params.rs` `use_hsd` docstring + `scvx.rs` dispatch comment said "no structured
+  HSD yet" — false since Phases 28–29; corrected.
+- `cone.rs` geomean docstring overstated NT-equality (it maps `s→y` on aligned bars
+  but is NOT the NT automorphism); the module doc called NT integration an
+  unfinished "P1b lift"; `structured_socp.rs` overstated the NT fallback-chain
+  parity — all corrected.
+- HANDOFF: TL;DR / quick-verify / final-state test counts (132 / 144 → **145**) and
+  the stale file count (23 → 27 `.rs`); plus a stray `_audit_hsd_check.py` an audit
+  agent left in the tree (removed).
+
+### Accepted LOW/INFO (documented, no code change)
+- HSD's best-feasible snapshot is keyed on primal feasibility + gap, NOT the dual
+  residual — correct for the self-dual embedding (small μ + primal feas + τ>0
+  certifies near-optimality); a returned `BestFeasible`/`Optimal` reflects
+  primal/gap quality, not dual-residual magnitude (promotion sign-off note).
+- The structured HSD `alpha<=0` no-snapshot exit returns `NumericalError` (→
+  outer-loop dense-HSD fallback) where dense returns `BestFeasible` — the
+  structured behavior is safe (triggers a useful re-solve) in that extreme corner.
+- INFO: block-Thomas lives in 3 places; positional cone indexing in
+  `build_cone_scale_diagonal`; the documented `== 0.0` sparsity test in `reduced_kkt`.
+
+### Verdict
+**145 tests pass, clippy `-D warnings` clean, thumb no_std (solver+FFI) clean,
+`mars_descent` byte-identical (`4.3699e3`).** The CRITICAL panic is fixed, all math
+is verified correct to machine precision, and the docs are reconciled. The codebase
+is sound and HSD is correctness-safe — the staged promotion can proceed.
+
+---
+
 ## Final state summary
 
 ```
-Tests:      144 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      145 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+              (144 → 145: Phase 32 deep re-audit added a regression test for the
+                              CRITICAL adaptive-trust clamp-panic fix
+                              (adaptive_trust_subfloor_rho_grow_no_panic))
               (142 → 144: Phases 29-30 added the structured FREE-tf HSD oracle gate
                               (rel-cost 3.9e-6) + its end-to-end test (‖ν‖ 1.5e-9,
                               0 fallbacks), completing the structured HSD matrix;
@@ -1921,8 +2001,8 @@ Unsafe:     zero in flight crates (FFI uses unsafe for raw pointers; all
               audited and bounded by null-check + caller contract)
 Alloc:      zero in flight crates (Box only in #[cfg(test)] and examples)
 Panic:      zero outside #[cfg(test)] (verified by grep)
-Files:      23 .rs files (21 production + 2 integration tests) + 1 example + 1 C header
-Lines:      ~7000 production LOC, ~6200 test LOC (rough estimate)
+Files:      27 .rs files (24 production + 3 integration tests) + 1 example + 1 C header
+Lines:      ~9000 production LOC, ~9000 test LOC (rough estimate; HSD added ~2k each)
 ```
 
 **The project is in a clean, audited, demonstrably-deployable state

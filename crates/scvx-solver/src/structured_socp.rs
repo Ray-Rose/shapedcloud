@@ -277,10 +277,13 @@ fn build_per_cone_arrow_blocks<const NCT: usize, const NCONES: usize>(
 ///
 /// Per-D dispatch over `D ∈ {1, 3, 4, 8, 11}`. Uses the exact closed-form NT
 /// scaling `soc_nt_scaling_exact` (vanishing-cone-stable) as the PRIMARY path,
-/// with `soc_nt_w_and_inverse` (geometric-mean Denman-Beavers) as the fallback —
-/// mirroring the dense path's `build_nt_block_for_cone`, so the structured NT
-/// driver stays per-step-equivalent to the dense NT driver (and inherits its
-/// vanishing-cone stability rather than the old DB overflow-to-`None`). Returns
+/// with plain `soc_nt_w_and_inverse` (Denman-Beavers) as the `.or_else` fallback.
+/// (The dense `build_nt_block_for_cone` additionally tries eigendecomp +
+/// Higham-scaled DB BEFORE plain DB; the structured fallback skips straight to
+/// plain DB. This is immaterial on/near the central path — where the exact path
+/// always succeeds and the fallback is never taken, so the structured/dense
+/// one-iter equivalence holds — but the two FALLBACK chains are not identical
+/// off-central.) Returns
 /// `None` if any per-cone NT computation fails (non-interior iterate, both
 /// scalings failing, or singular `arrow(s̃)`) — the IPM caller bails to
 /// `numerical_exit`, and the SCvx outer loop falls back to the dense NT driver.

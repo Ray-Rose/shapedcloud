@@ -229,6 +229,17 @@ pub fn solve_scvx<
         || algo.trust_beta < 1.0
         || !algo.virt_weight.is_finite()
         || algo.virt_weight < 0.0
+        // The trust-region ρ thresholds + convergence tolerances. `rho_shrink`/
+        // `rho_grow` feed the adaptive-trust relaxation (a NaN there is a clamp/
+        // NaN-propagation hazard; a negative is nonsensical). `rho_reject` gates
+        // accept (`rho > rho_reject`) — a NaN silently never-accepts. `conv_tol_*`
+        // gate the convergence test — a NaN makes it unsatisfiable. Reject all up
+        // front per the no-panic / BadInput-on-pathological-input contract.
+        || !algo.rho_shrink.is_finite() || algo.rho_shrink < 0.0
+        || !algo.rho_grow.is_finite()   || algo.rho_grow   < 0.0
+        || !algo.rho_reject.is_finite()
+        || !algo.conv_tol_x.is_finite()
+        || !algo.conv_tol_virt.is_finite()
     {
         return SolverStatus::BadInput;
     }
@@ -450,9 +461,10 @@ pub fn solve_scvx<
         };
 
         // 3. Solve the inner SOCP. If `use_hsd` is set it OVERRIDES the matrix
-        // below (→ `solve_socp_hsd`, the Phase-26 homogeneous self-dual driver,
-        // which has no structured/NT/free-tf variants — one driver, all cells).
-        // Otherwise the AHO/NT dispatch matrix (Phase 6.10 — complete):
+        // below: → the dense `solve_socp_hsd` (Phase 26), or — when
+        // `use_structured_solve` is also set — the O(N) block-tridiagonal
+        // structured HSD `solve_socp_structured_hsd[_free_tf]` (Phases 28–29) with
+        // a dense-HSD fallback. Otherwise the AHO/NT dispatch matrix (Phase 6.10):
         //
         //   structured  nt   free_tf │ driver                            fallback
         //   ─────────────────────────────────────────────────────────────────────
@@ -788,9 +800,21 @@ pub fn solve_scvx<
         let (rho_shrink_eff, rho_grow_eff) =
             if algo.use_adaptive_trust && workspace.rho_ceiling < algo.rho_shrink {
                 let ceil = workspace.rho_ceiling;
+                // Floor-then-cap, NOT `.clamp(FLOOR, configured)`: `f64::clamp`
+                // PANICS when its `min > max`, which is reachable here whenever a
+                // caller sets `rho_shrink < ADAPT_SHRINK_FLOOR` (0.02) or
+                // `rho_grow < ADAPT_GROW_FLOOR` (0.1) — both plausible
+                // aggressive-trust tunings — once the ceiling drops below
+                // `rho_shrink` (the normal flight-scale relaxation regime). Under
+                // `panic = "abort"` that is a process abort, violating the no-panic
+                // flight contract. `.max(FLOOR).min(configured)` is identical to the
+                // clamp whenever `FLOOR <= configured` (every nominal config) and is
+                // panic-free otherwise (it returns the configured value, which is
+                // already more aggressive than the floor — the relaxation has no
+                // room to act, matching the else-branch's plain `algo.rho_*`).
                 (
-                    (ADAPT_SHRINK_FRAC * ceil).clamp(ADAPT_SHRINK_FLOOR, algo.rho_shrink),
-                    (ADAPT_GROW_FRAC   * ceil).clamp(ADAPT_GROW_FLOOR,   algo.rho_grow),
+                    (ADAPT_SHRINK_FRAC * ceil).max(ADAPT_SHRINK_FLOOR).min(algo.rho_shrink),
+                    (ADAPT_GROW_FRAC   * ceil).max(ADAPT_GROW_FLOOR).min(algo.rho_grow),
                 )
             } else {
                 (algo.rho_shrink, algo.rho_grow)
@@ -1300,6 +1324,54 @@ mod tests {
                 solve_scvx(&mut ws, &phys, &algo_bad_beta, &ipm, &x_init, &term),
                 SolverStatus::BadInput
             ), "trust_beta < 1 should yield BadInput");
+        });
+    }
+
+    /// **Regression — adaptive-trust clamp must not panic on sub-floor ρ
+    /// thresholds.** A caller setting `rho_grow < ADAPT_GROW_FLOOR` (0.1) with
+    /// `use_adaptive_trust` (the default) on a flight-scale problem whose ρ
+    /// ceiling falls below `rho_shrink` enters the relaxation branch, which once
+    /// computed `clamp(0.1, rho_grow)` — a `min > max` panic / process abort
+    /// under `panic = "abort"`. `rho_grow = 0.05` is a VALID (finite,
+    /// non-negative) value, so it must NOT yield BadInput; and the floor-then-cap
+    /// form must run to completion — reaching the final assertion at all proves
+    /// no abort. (Active-drag config: its ρ ceiling seeds ~0.1–0.2 < the default
+    /// `rho_shrink = 0.25`, so the relaxation branch fires.)
+    #[test]
+    fn adaptive_trust_subfloor_rho_grow_no_panic() {
+        run_in_big_stack(|| {
+            const N: usize         = 5;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 15;
+
+            let phys = PhysicalParams { rho: 0.02, cd_a: 50.0, ..mars_params() };
+            let mut x_init = SVector::<f64, 7>::zeros();
+            x_init[2] = 100.0; x_init[5] = -10.0; x_init[6] = (800.0_f64).ln();
+            let mut x_target = SVector::<f64, 7>::zeros();
+            x_target[6] = (700.0_f64).ln();
+
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = Box::default();
+            ws.reference = linear_reference::<N>(x_init, x_target, 750.0, 25.0);
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+
+            let algo = ScvxAlgoParams {
+                trust_eta0:    50.0,
+                trust_eta_max: 200.0,
+                trust_eta_min: 1.0e-3,
+                rho_grow:      0.05,   // < ADAPT_GROW_FLOOR (0.1) — the old panic value
+                ..ScvxAlgoParams::default()   // use_adaptive_trust=true, rho_shrink=0.25
+            };
+            let ipm = IpmAlgoParams { use_preconditioning: true, ..IpmAlgoParams::default() };
+
+            // Must run to completion (no clamp panic/abort); rho_grow=0.05 is valid.
+            let status = solve_scvx(&mut ws, &phys, &algo, &ipm, &x_init, &term);
+            assert!(
+                !matches!(status, SolverStatus::BadInput),
+                "rho_grow=0.05 is valid; got BadInput (status {})", status as u32
+            );
         });
     }
 

@@ -186,11 +186,13 @@ pub struct IpmAlgoParams {
     /// than even AHO — see HANDOFF "Phase 26". It cold-starts from the self-dual
     /// central point, so it IGNORES `warm_start_x` and any seeded `ws.x`, and is
     /// dimension-generic over fixed-/free-tf (the `δτ` variable and `τ`-bound
-    /// cones are handled transparently — no separate free-tf driver). When set,
-    /// it takes PRECEDENCE over `use_nt_scaling` and `ScvxAlgoParams::
-    /// use_structured_solve` (there is no structured HSD yet — that is the O(N)
-    /// follow-up). Defaults to `false` (AHO remains the hardened production
-    /// default until HSD is re-audited at the same depth).
+    /// cones are handled transparently). When set, it takes PRECEDENCE over
+    /// `use_nt_scaling`; combined with `ScvxAlgoParams::use_structured_solve` it
+    /// dispatches to the **O(N)** block-tridiagonal structured HSD
+    /// (`solve_socp_structured_hsd` / `_free_tf`, Phases 28–29) with a dense-HSD
+    /// fallback, else the dense `solve_socp_hsd`. Defaults to `false` (AHO remains
+    /// the hardened production default; HSD is the recommended opt-in, with a
+    /// staged-promotion checklist in HANDOFF "Phase 31").
     pub use_hsd: bool,
 }
 
