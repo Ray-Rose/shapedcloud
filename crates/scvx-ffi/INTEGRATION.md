@@ -206,7 +206,9 @@ finite.
 
 Key fields: `initial_tau` (time-of-flight guess, `> 0`); `target_mass` (must be
 in `[m_dry, m_wet]`); `use_free_tf` (see §4.1); `use_preconditioning` (keep
-`1`); `use_nt_scaling` (NT direction — opt-in, see §8); `max_outer_iters`,
+`1`); `use_hsd` (HSD direction — **on by default**, see §8); `use_structured_solve`
+(opt-in O(N) structured solve); `use_nt_scaling` (NT direction — opt-in, see §8);
+`max_outer_iters`,
 `max_inner_iters` (compile-time-capped at 20 outer in the FFI); the `conv_tol_*`
 / `ipm_tol` tolerances; and the trust-region `trust_eta*` / `virt_weight`
 parameters.
@@ -263,16 +265,23 @@ Row-major, node-indexed (`k = 0 .. N-1`). Layout mirrors the Rust side exactly:
 
 ## 8. Solver-mode notes
 
-- **AHO direction (default, `use_nt_scaling = 0`)** is the validated production
-  path.
-- **NT direction (`use_nt_scaling = 1`)** is an opt-in alternative. On hard
-  flight-scale subproblems its inner IPM can fail to converge in the endgame;
-  when it does, the solver **falls back** to the dense AHO driver automatically,
-  so enabling NT never breaks a solve — it is at worst a no-op cost. (Details in
-  `HANDOFF.md`, "NT endgame" notes.)
-- **Structured solver** (block-tridiagonal Schur) is selected internally and is
-  numerically equivalent to the dense path (verified to machine precision); it
-  falls back to dense on any per-iteration breakdown.
+- **HSD direction (default, `use_hsd = 1`)** — the homogeneous self-dual embedded
+  IPM is the production default (Phase 33). It converges on flight-scale
+  subproblems where plain NT diverges and AHO struggles, matching the external
+  CVXPY/Clarabel + Julia oracle to ~1e-7, and takes precedence over
+  `use_nt_scaling`. (HANDOFF "Phase 26"/"Phase 33".)
+- **AHO direction (`use_hsd = 0`, `use_nt_scaling = 0`)** is the robust reference /
+  fallback direction — the previous default, still fully reachable and validated.
+- **NT direction (`use_nt_scaling = 1`, with `use_hsd = 0`)** is an opt-in
+  alternative. On hard flight-scale subproblems its inner IPM can fail to converge
+  in the endgame; when it does, the solver **falls back** to the dense AHO driver
+  automatically, so enabling NT never breaks a solve — it is at worst a no-op cost.
+  (Details in `HANDOFF.md`, "NT endgame" notes.)
+- **Structured solver** (`use_structured_solve = 1`, block-tridiagonal Schur) is
+  the O(N) inner solve; combined with `use_hsd` it selects the structured HSD
+  (~7× faster than dense at N=7, zero fallbacks). It is numerically equivalent to
+  the dense path (verified to machine precision) and falls back to dense on any
+  per-iteration breakdown.
 
 ---
 

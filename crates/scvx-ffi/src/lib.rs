@@ -169,6 +169,14 @@ pub struct COptions {
     /// 0 = AHO, non-zero = NT. **AHO recommended** (NT is not yet
     /// convergent on all configurations; see HANDOFF.md).
     pub use_nt_scaling:       u8,
+    /// 0 = disabled, non-zero = **HSD** (homogeneous self-dual) direction — the
+    /// recommended direction; takes precedence over `use_nt_scaling`. Converges
+    /// where NT diverges (see HANDOFF.md "Phase 26").
+    pub use_hsd:              u8,
+    /// 0 = disabled, non-zero = O(N) block-tridiagonal structured solve. With
+    /// `use_hsd` non-zero this selects the structured HSD (~7× faster at N=7,
+    /// zero fallbacks). Default off.
+    pub use_structured_solve: u8,
     pub max_outer_iters:      u32,
     pub max_inner_iters:      u32,
     pub conv_tol_x:           f64,
@@ -189,6 +197,8 @@ impl From<&COptions> for PoweredDescentOptions {
             use_preconditioning:  o.use_preconditioning  != 0,
             use_cone_row_scaling: o.use_cone_row_scaling != 0,
             use_nt_scaling:       o.use_nt_scaling       != 0,
+            use_hsd:              o.use_hsd              != 0,
+            use_structured_solve: o.use_structured_solve != 0,
             max_outer_iters:      o.max_outer_iters,
             max_inner_iters:      o.max_inner_iters,
             conv_tol_x:           o.conv_tol_x,
@@ -227,6 +237,8 @@ pub unsafe extern "C" fn scvx_options_default(options: *mut COptions) -> ScvxSta
             use_preconditioning:  d.use_preconditioning  as u8,
             use_cone_row_scaling: d.use_cone_row_scaling as u8,
             use_nt_scaling:       d.use_nt_scaling       as u8,
+            use_hsd:              d.use_hsd              as u8,
+            use_structured_solve: d.use_structured_solve as u8,
             max_outer_iters:      d.max_outer_iters,
             max_inner_iters:      d.max_inner_iters,
             conv_tol_x:           d.conv_tol_x,
@@ -577,6 +589,11 @@ mod tests {
         assert_eq!(status, ScvxStatus::Converged);
         assert_eq!(opts.use_free_tf, 1);
         assert_eq!(opts.use_preconditioning, 1);
+        // HSD is the promoted production default (Phase 33); structured stays
+        // opt-in. A C caller calling scvx_options_default gets HSD.
+        assert_eq!(opts.use_hsd, 1);
+        assert_eq!(opts.use_structured_solve, 0);
+        assert_eq!(opts.use_nt_scaling, 0);
         assert_eq!(opts.max_outer_iters, 15);
     }
 
@@ -987,6 +1004,63 @@ mod tests {
                 assert!(traj10.sigma[k].is_finite());
             }
             assert!(traj10.tau.is_finite() && traj10.tau > 0.0);
+        });
+    }
+
+    /// **FFI smoke — the HSD direction is reachable through the C-ABI
+    /// (promotion checklist #1).** `COptions::use_hsd` (+ `use_structured_solve`)
+    /// now thread `COptions → PoweredDescentOptions → IpmAlgoParams/
+    /// ScvxAlgoParams → solve_scvx` dispatch. A C caller can select BOTH the
+    /// dense HSD and the O(N) structured HSD and get a finite trajectory back
+    /// (no BadInput / NullPointer / abort).
+    #[test]
+    fn ffi_solve_with_hsd_runs_and_stays_finite() {
+        run_in_big_stack(|| {
+            let phys = mars_params();
+            let initial_state = [0.0, 0.0, 2.0, 0.0, 0.0, -0.1, (400.0_f64).ln()];
+            let terminal = CTerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+
+            // (a) dense HSD, then (b) the O(N) structured HSD — both via use_hsd.
+            for (label, structured) in [("dense-HSD", 0u8), ("structured-HSD", 1u8)] {
+                let mut options: COptions = unsafe { core::mem::zeroed() };
+                unsafe { scvx_options_default(&mut options); }
+                options.initial_tau = 10.0;
+                options.target_mass = 380.0;
+                options.use_free_tf = 0;
+                options.use_hsd = 1;
+                options.use_structured_solve = structured;
+
+                let size8 = scvx_workspace_size_n8();
+                let mut buf8: Vec<u8> = vec![0; size8];
+                let mut traj8: CTrajectoryN8 = unsafe { core::mem::zeroed() };
+                let st8 = unsafe {
+                    scvx_solve_n8(
+                        &phys as *const _, initial_state.as_ptr(),
+                        &terminal as *const _, &options as *const _,
+                        buf8.as_mut_ptr(), &mut traj8 as *mut _,
+                    )
+                };
+                eprintln!("FFI {label} N=8 status: {st8:?}");
+                assert_ne!(st8, ScvxStatus::BadInput, "{label}: HSD via FFI returned BadInput");
+                assert_ne!(st8, ScvxStatus::NullPointer);
+                for k in 0..8 {
+                    for i in 0..3 {
+                        assert!(traj8.r[k][i].is_finite() && traj8.v[k][i].is_finite()
+                                && traj8.u[k][i].is_finite(), "{label}: non-finite at k={k}");
+                    }
+                    assert!(traj8.mass[k].is_finite() && traj8.mass[k] > 0.0);
+                    assert!(traj8.sigma[k].is_finite());
+                }
+                assert!(traj8.tau.is_finite() && traj8.tau > 0.0);
+            }
+            // NOTE: HSD spans the full FFI N range (3..20), but at large N the
+            // dense NCT×NCT scaling matrices the inner solve builds on the stack
+            // (NCT = 30·N → ~2.9 MB each at N=20) require a correspondingly large
+            // thread stack — a general property of ALL directions (AHO/NT/HSD),
+            // not HSD-specific. The committed N≤10 coverage here + the
+            // `scvx_converges_with_hsd_larger_n` (N=10) gate + the O(N) time
+            // benchmark establish the scaling; the production integrator sizes the
+            // static arena / stack for the chosen max N (see INTEGRATION.md).
         });
     }
 }

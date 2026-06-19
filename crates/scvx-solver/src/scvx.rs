@@ -574,7 +574,9 @@ pub fn solve_scvx<
             // Dense NT (no structured solve requested).
             solve_socp_nt(&workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws)
         } else {
-            // Dense AHO (default).
+            // Dense AHO — the reference direction (reached when neither use_hsd
+            // nor use_nt_scaling is set; the high-level product default sets
+            // use_hsd, so this is the explicit `use_hsd = false` fallback path).
             solve_socp(&workspace.prob, &warm_ipm_params, &mut workspace.ipm_ws)
         };
         let inner_ok = matches!(
@@ -3792,6 +3794,78 @@ mod tests {
         thread::Builder::new()
             .stack_size(128 * 1024 * 1024)
             .spawn(body).expect("spawn").join().expect("larger-N test panicked");
+    }
+
+    /// **HSD larger-N convergence (promotion readiness — the N-sweep gate).** The
+    /// same N=10 / 100 m flight scenario as `scvx_converges_larger_n_adaptive_trust`
+    /// but driven by the O(N) structured HSD (`use_hsd` + `use_structured_solve`).
+    /// Confirms HSD scales to the larger end of the production node range and
+    /// converges to machine-precision dynamics feasibility with no fallback
+    /// erosion. (The FFI smoke `ffi_solve_with_hsd_runs_and_stays_finite` covers
+    /// N=8 dense+structured through the C-ABI; large N needs a correspondingly
+    /// larger stack for the dense scaling matrices — a property shared by all
+    /// directions, see that test's note.)
+    #[test]
+    fn scvx_converges_with_hsd_larger_n() {
+        let body = || {
+            const N: usize         = 10;
+            const NP: usize        = N * N_VARS_PER_NODE_SCVX;
+            const NE: usize        = N * N_EQ_PER_DYN + N_EQ_TERMINAL;
+            const NCT: usize       = N * N_CONE_DIM_PER_NODE_SCVX;
+            const NCONES: usize    = N * N_CONES_PER_NODE_SCVX;
+            const MAX_OUTER: usize = 20;
+
+            let phys = mars_params();
+            let mut x0 = SVector::<f64, 7>::zeros();
+            x0[2] = 100.0; x0[5] = -10.0; x0[6] = (800.0_f64).ln();
+            let mut xt = SVector::<f64, 7>::zeros();
+            xt[6] = (700.0_f64).ln();
+
+            let mut ws: Box<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>> = Box::default();
+            ws.reference = linear_reference::<N>(x0, xt, 750.0, 25.0);
+            let term = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+
+            let algo = ScvxAlgoParams {
+                trust_eta0:           50.0,
+                trust_eta_max:        200.0,
+                trust_eta_min:        1.0e-3,
+                use_structured_solve: true,   // O(N) structured HSD
+                ..ScvxAlgoParams::default()
+            };
+            let ipm = IpmAlgoParams {
+                max_iters:           50,
+                tol_mu:              1.0e-3,
+                tol_primal:          1.0e-3,
+                tol_dual:            1.0e-3,
+                tol_gap:             1.0e-3,
+                use_hsd:             true,
+                use_preconditioning: true,
+                ..IpmAlgoParams::default()
+            };
+
+            let status = solve_scvx(&mut ws, &phys, &algo, &ipm, &x0, &term);
+            let last = ws.iter as usize;
+            let hi = last.min(ws.history.len().saturating_sub(1));
+            let mut min_virt = f64::INFINITY;
+            for i in 0..=hi {
+                let r = &ws.history[i];
+                assert!(r.ipm_status == 0 || r.ipm_status == 1,
+                    "HSD N=10 outer iter {i}: inner status {} (expected 0/1)", r.ipm_status);
+                if r.accepted && r.virt_l1.is_finite() && r.virt_l1 < min_virt {
+                    min_virt = r.virt_l1;
+                }
+            }
+            eprintln!("HSD N=10: status={} outer={} min‖ν‖={:.3e} fallbacks={}",
+                      status as u32, last + 1, min_virt, ws.structured_fallbacks);
+            assert!(matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "HSD N=10 hit {} (expected Converged/OuterIterCap)", status as u32);
+            assert!(min_virt < 1.0e-6, "HSD N=10 min‖ν‖ = {min_virt:.3e} (expected < 1e-6)");
+            assert!(ws.structured_fallbacks <= 2,
+                "HSD N=10: {} fallbacks (expected ~0)", ws.structured_fallbacks);
+        };
+        thread::Builder::new()
+            .stack_size(128 * 1024 * 1024)
+            .spawn(body).expect("spawn").join().expect("HSD larger-N test panicked");
     }
 
     // =======================================================================

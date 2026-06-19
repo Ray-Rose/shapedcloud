@@ -190,9 +190,11 @@ pub struct IpmAlgoParams {
     /// `use_nt_scaling`; combined with `ScvxAlgoParams::use_structured_solve` it
     /// dispatches to the **O(N)** block-tridiagonal structured HSD
     /// (`solve_socp_structured_hsd` / `_free_tf`, Phases 28–29) with a dense-HSD
-    /// fallback, else the dense `solve_socp_hsd`. Defaults to `false` (AHO remains
-    /// the hardened production default; HSD is the recommended opt-in, with a
-    /// staged-promotion checklist in HANDOFF "Phase 31").
+    /// fallback, else the dense `solve_socp_hsd`. Defaults to `false` *at this
+    /// low level* so direct-IPM callers and regression tests keep the AHO
+    /// reference behavior — but the **product default is now HSD**: the high-level
+    /// `PoweredDescentOptions::default()` and the FFI `scvx_options_default` set
+    /// this `true` (Phase 33 promotion; HANDOFF Phases 31–33).
     pub use_hsd: bool,
 }
 

@@ -13,7 +13,9 @@
 //! Colombo-Gondzio corrector). The NT matrix-sqrt primitives live in
 //! `crate::cone`. (NT converges on well-conditioned problems but stalls in
 //! the endgame on the flight-scale SCvx subproblem — see HANDOFF "NT
-//! endgame"; AHO is the production default.)
+//! endgame"; AHO is the robust reference direction. The production default is
+//! now the homogeneous self-dual [`solve_socp_hsd`], which cracks exactly this
+//! NT endgame limit — see HANDOFF "Phase 26"/"Phase 33".)
 //!
 //! Dense reduced-KKT solve via Schur complement on `(H, Aᵀ; A, 0)`. The
 //! LTV-structured (block-tridiagonal) substitution for `H⁻¹` lives in
@@ -2211,5 +2213,98 @@ mod tests {
             );
         }
         assert!((result.x[1] + result.x[2] - 1.0).abs() < 1.0e-3);
+    }
+
+    /// **WCET (promotion readiness) — the HSD inner loop honors its iteration
+    /// bound.** `solve_socp_hsd`'s loop is `0..max_iters.min(IPM_HARD_MAX_ITERS)`
+    /// — the SAME compile-time clamp AHO/NT use — so a Rust/FFI caller cannot blow
+    /// the flight time budget by requesting a huge `max_iters`.
+    ///
+    /// HSD converges on well-posed toys in well under the 64 cap, so a bare
+    /// `max_iters = 200 ⇒ iters ≤ 64` check would be VACUOUS (it holds even if the
+    /// clamp were deleted, because this problem never wants 64 iters). We instead
+    /// make the bound LOAD-BEARING: cap `max_iters` *below* the natural convergence
+    /// count and require the loop to stop there. This is the ONLY guard on the HSD
+    /// loop bound — HSD has its own loop, distinct from AHO's (which is covered by
+    /// `scvx::tests::ipm_iters_respect_hard_cap` via engineered non-convergence).
+    #[test]
+    fn hsd_respects_hard_iter_cap() {
+        const NP: usize = 3;
+        const NE: usize = 1;
+        const NCT: usize = 3;
+        const NCONES: usize = 1;
+        let prob = SocpProblem::<NP, NE, NCT, NCONES> {
+            c:     SVector::<f64, 3>::from_column_slice(&[1.0, 0.0, 0.0]),
+            a_mat: SMatrix::<f64, 1, 3>::from_row_slice(&[0.0, 1.0, 1.0]),
+            b:     SVector::<f64, 1>::from_element(1.0),
+            g_mat: -SMatrix::<f64, 3, 3>::identity(),
+            h:     SVector::<f64, 3>::zeros(),
+            cones: [ConeDesc { offset: 0, dim: 3 }],
+        };
+
+        // (1) LOAD-BEARING: max_iters = 3 is below this toy's natural convergence
+        // — the loose best-feasible screen cannot fire before `iter > 2`, and
+        // strict μ-convergence needs more — so the loop MUST stop at the bound.
+        // If the `.min(..)` loop bound were removed, the solve would run on to
+        // natural convergence and report > 3, failing this assertion.
+        let mut ws_capped = SocpWorkspace::<NP, NE, NCT>::default();
+        let capped = solve_socp_hsd(
+            &prob,
+            &IpmAlgoParams { max_iters: 3, ..IpmAlgoParams::default() },
+            &mut ws_capped,
+        );
+        assert!(
+            capped.iters <= 3,
+            "HSD ignored max_iters=3 and ran {} iters — loop bound not enforced",
+            capped.iters
+        );
+
+        // (2) STRUCTURAL CEILING: the same `max_iters.min(IPM_HARD_MAX_ITERS)` bound
+        // clamps an absurd caller request to the compile-time cap, so a
+        // `max_iters = 200` caller can never exceed the 64-iter WCET budget —
+        // identical to the AHO/NT guarantee.
+        let mut ws_huge = SocpWorkspace::<NP, NE, NCT>::default();
+        let huge = solve_socp_hsd(
+            &prob,
+            &IpmAlgoParams { max_iters: 200, ..IpmAlgoParams::default() },
+            &mut ws_huge,
+        );
+        assert!(
+            huge.iters <= IPM_HARD_MAX_ITERS,
+            "HSD iters {} exceeded the hard cap {}", huge.iters, IPM_HARD_MAX_ITERS
+        );
+    }
+
+    /// **Determinism (promotion readiness) — HSD is bit-reproducible.** HSD uses
+    /// only f64 IEEE-754 + `libm` transcendentals, no RNG, no threading — the same
+    /// determinism basis as AHO. Two independent solves of the same problem must
+    /// produce BIT-identical `(x, s, y, status, iters)`.
+    #[test]
+    fn hsd_solve_is_bit_deterministic() {
+        const NP: usize = 3;
+        const NE: usize = 2;
+        const NCT: usize = 4;
+        const NCONES: usize = 2;
+        let prob = SocpProblem::<NP, NE, NCT, NCONES> {
+            c:     SVector::<f64, 3>::from_column_slice(&[0.0, 0.0, 1.0]),
+            a_mat: SMatrix::<f64, 2, 3>::from_row_slice(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            b:     SVector::<f64, 2>::from_column_slice(&[1.0, 1.0]),
+            g_mat: SMatrix::<f64, 4, 3>::from_row_slice(&[
+                 0.0,  0.0, -1.0,  -1.0,  0.0,  0.0,
+                 0.0, -1.0,  0.0,   0.0,  0.0, -1.0,
+            ]),
+            h:     SVector::<f64, 4>::from_column_slice(&[0.0, 0.0, 0.0, -2.0]),
+            cones: [ConeDesc { offset: 0, dim: 3 }, ConeDesc { offset: 3, dim: 1 }],
+        };
+        let params = IpmAlgoParams::default();
+        let mut ws1 = SocpWorkspace::<NP, NE, NCT>::default();
+        let mut ws2 = SocpWorkspace::<NP, NE, NCT>::default();
+        let r1 = solve_socp_hsd(&prob, &params, &mut ws1);
+        let r2 = solve_socp_hsd(&prob, &params, &mut ws2);
+        assert_eq!(r1.status.as_u32(), r2.status.as_u32());
+        assert_eq!(r1.iters, r2.iters);
+        for i in 0..NP  { assert_eq!(r1.x[i].to_bits(), r2.x[i].to_bits(), "x[{i}] not bit-identical"); }
+        for i in 0..NCT { assert_eq!(r1.s[i].to_bits(), r2.s[i].to_bits(), "s[{i}] not bit-identical"); }
+        for i in 0..NCT { assert_eq!(r1.y[i].to_bits(), r2.y[i].to_bits(), "y[{i}] not bit-identical"); }
     }
 }

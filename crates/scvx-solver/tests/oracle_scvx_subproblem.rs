@@ -395,7 +395,8 @@ fn run_hsd<const NP: usize, const NE2: usize, const NCT: usize, const NCONES: us
 /// virtual-control SOC^8 cones carry `μ_cone ~ 1e-4` while thrust/trust carry
 /// ~1e7, so `H = GᵀW²G` is catastrophically ill-conditioned). A real fix needs
 /// a wide-neighborhood / per-cone-balanced centering scheme (IPM research), not
-/// a better scaling. AHO stays the production default; NT stays opt-in.
+/// a better scaling. AHO stays the robust reference direction and HSD (Phase 26)
+/// is the production default that actually cracks this; NT stays opt-in.
 #[test]
 #[ignore]
 fn diag_nt_on_flight_subproblem() {
@@ -497,7 +498,7 @@ fn rust_ipm_matches_external_oracle_scvx_freetf() {
 // `|Ax-b|` grows to ~9-29, duality gap `s·y/n` explodes to ~1e12-1e14 — see
 // `diag_nt_on_flight_subproblem`). The homogeneous self-dual embedding
 // (`solve_socp_hsd`) instead converges to the external CVXPY/Clarabel + Julia
-// optimum, MORE tightly and faster than even the production AHO default
+// optimum, MORE tightly and faster than even the AHO reference direction
 // (measured fixed-tf: HSD rel-cost ~8.5e-8 in ~15 iters vs AHO ~5e-4 in 60).
 // HSD cold-starts from the self-dual central point (no warm-start).
 // ===========================================================================

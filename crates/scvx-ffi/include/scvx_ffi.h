@@ -151,6 +151,10 @@ typedef struct COptions {
     uint8_t use_preconditioning;  /* 1 = per-variable column scaling. RECOMMENDED. */
     uint8_t use_cone_row_scaling; /* 1 = per-cone slack row scaling. AHO-only. */
     uint8_t use_nt_scaling;       /* 1 = NT direction. AHO (=0) is the safer default. */
+    uint8_t use_hsd;              /* 1 = HSD (homogeneous self-dual) direction. RECOMMENDED;
+                                     converges where NT diverges. Precedes use_nt_scaling. */
+    uint8_t use_structured_solve; /* 1 = O(N) block-tridiagonal structured solve; with
+                                     use_hsd this is the structured HSD (~7x faster, N=7). */
 
     uint32_t max_outer_iters;    /* SCvx outer loop cap, e.g. 15. */
     uint32_t max_inner_iters;    /* IPM inner loop cap, e.g. 25. */

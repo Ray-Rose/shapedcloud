@@ -13,8 +13,8 @@ a context-window roll-over so the next session starts coherent.
   free-final-time. Static-memory, no-`std`, no-`alloc`, no-`panic`,
   bounded-WCET — "research-grade flight-shaped" per the original plan.
 - **Where**: the repository workspace root (all paths below are repo-relative)
-- **State**: **144 tests pass** across **5 crates** (132 pre-HSD + 12 from the
-  HSD work, Phases 26–31 — see those sections + the final-state summary),
+- **State**: **150 tests pass** across **5 crates** (132 pre-HSD + 18 from the
+  HSD work, Phases 26–33 — see those sections + the final-state summary),
   `cargo clippy --all-targets -- -D warnings` clean,
   `cargo build --release --target thumbv7em-none-eabihf -p scvx-solver`
   clean (the no_std flight crates cross-compile to ARM Cortex-M), and the
@@ -227,11 +227,13 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --target thumbv7em-none-eabihf
 ```
 
-Expected: 144 tests pass (split as `0+17+48+54+3+6+8+8`
-= core 0, dynamics 17, ipm 48, solver-lib 54, oracle_diff 3,
-oracle_scvx_subproblem 6, wcet 8, ffi 8; the HSD work — Phases 26–31 — added the
-+2 ipm (toy HSD), +6 solver-lib (HSD end-to-end), +4 oracle_scvx (HSD oracle
-gates), plus an `#[ignore]`d HSD scaling benchmark in wcet;
+Expected: 150 tests pass (split as `0+17+50+57+3+6+8+9`
+= core 0, dynamics 17, ipm 50, solver-lib 57, oracle_diff 3,
+oracle_scvx_subproblem 6, wcet 8, ffi 9; the HSD work — Phases 26–33 — added the
++4 ipm (toy HSD + load-bearing hard-cap + determinism), +9 solver-lib (HSD
+end-to-end + larger-N + adaptive-trust regression + AHO reference-path), +4
+oracle_scvx (HSD oracle gates), +1 ffi (HSD smoke), plus an `#[ignore]`d HSD
+scaling benchmark in wcet;
 **note**: a Windows Application Control / Defender policy sometimes
 transiently blocks a freshly-recompiled debug test binary (`os error
 4551`); if `cargo test` aborts mid-run with "An Application Control
@@ -1851,6 +1853,10 @@ hardening AHO received — and is the agreed activation path, NOT an oversight.
 (Reviewed and confirmed: keep AHO default + HSD recommended-opt-in; revisit the
 flip after the checklist.)
 
+> **→ SUPERSEDED by Phase 33**: the checklist was subsequently completed and the
+> default *was* flipped to HSD. This Phase-31 note is period-correct history; the
+> live default is now `use_hsd = true`. See **Phase 33** below.
+
 ---
 
 ## Phase 32 — pre-promotion deep re-audit (CRITICAL flight-safety fix) (LANDED)
@@ -1927,10 +1933,80 @@ is sound and HSD is correctness-safe — the staged promotion can proceed.
 
 ---
 
+## Phase 33 — HSD promoted to the PRODUCTION DEFAULT (LANDED)
+
+The Phase-31 staged-promotion checklist is complete; HSD is now the default.
+
+### The checklist, executed
+1. **FFI/API exposure** — `use_hsd` + `use_structured_solve` added to
+   `PoweredDescentOptions` (threaded into `IpmAlgoParams`/`ScvxAlgoParams`) and to
+   the C-ABI `COptions` (+ the `From` conversion, `scvx_options_default`, and the
+   `scvx_ffi.h` header, field-for-field ABI parity). FFI smoke test
+   `ffi_solve_with_hsd_runs_and_stays_finite` confirms a C caller can select dense
+   AND structured HSD and get a finite trajectory.
+2. **Determinism** — `hsd_solve_is_bit_deterministic`: two solves are BIT-identical
+   (`to_bits()` on x/s/y). HSD uses only f64 IEEE-754 + `libm` (no RNG/threading) —
+   the same cross-platform bit-match mechanism as AHO.
+3. **WCET + N-sweep** — `hsd_respects_hard_iter_cap`: HSD honors the compile-time
+   `IPM_HARD_MAX_ITERS = 64` (a `max_iters = 200` caller cannot blow the budget).
+   `scvx_converges_with_hsd_larger_n` (N=10): the O(N) structured HSD converges to
+   ‖ν‖ 7.7e-9 with ZERO fallbacks; the FFI smoke covers N=8 dense+structured. (At
+   large N the dense `NCT×NCT` scaling matrices need a correspondingly larger
+   stack — a property of ALL directions, not HSD-specific; the integrator sizes
+   the static arena for the chosen max N.)
+4. **The flip** — `PoweredDescentOptions::default().use_hsd = true`. This makes the
+   high-level API, the FFI `scvx_options_default`, and the `mars_descent` example
+   default to (dense) HSD. `use_structured_solve` stays opt-in (dense is the
+   more-audited HSD path; structured is the O(N) speed option). AHO is fully
+   reachable via `use_hsd = false` and remains the documented reference.
+
+### Blast radius — clean
+All **150 tests pass** with the flipped default (the FFI solve tests now exercise
+HSD by default and pass). The `mars_descent` example now demos HSD: **cost
+4.3702e3**, essentially identical to AHO's **4.3699e3** (HSD finds the same
+trajectory — the 0.007% difference is endgame-tolerance, not a different optimum).
+The AHO baseline `4.3699e3` is preserved + reproducible via `use_hsd = false`.
+clippy `-D warnings` clean, thumb no_std (solver+FFI) clean.
+
+### Adversarial review (pre-commit)
+A from-scratch adversarial review of the promotion diff (FFI ABI parity, the
+default-flip blast radius, new-test quality, doc-truth) returned **SHIP-WITH-NITS**.
+- **ABI parity: VERIFIED** — `COptions` (`#[repr(C)]`) and `scvx_ffi.h` declare the
+  six `u8` flags in identical order/type, the `From` conversion maps each field to
+  its namesake (no swap), and `scvx_options_default` matches the flipped Rust
+  default. No memory-safety / wrong-behavior bug at the C boundary.
+- **Two findings fixed before commit**:
+  - *Vacuous WCET assert* — `hsd_respects_hard_iter_cap` asserted `iters ≤ 64` on a
+    toy converging in ~10 iters, so it held even if the loop bound were deleted. Now
+    LOAD-BEARING: caps `max_iters = 3` below natural convergence and requires the
+    loop to stop there (the only guard on HSD's own loop, distinct from AHO's
+    `ipm_iters_respect_hard_cap`).
+  - *Lost AHO coverage* — post-flip, no end-to-end test drove the AHO reference path
+    through the high-level API. Added `solve_powered_descent_aho_reference_path`
+    (`use_hsd = false`), keeping the advertised reference path honest.
+- Doc-truth (test split, costs, ‖ν‖) verified internally consistent.
+
+### Net
+HSD — the homogeneous self-dual driver that cracked the NT/O(N) frontier (Phase
+26), runs end-to-end across the envelope (27), in O(N) (28–30), survived a
+from-scratch deep re-audit (32 — which also fixed a latent adaptive-trust panic),
+and is now FFI-exposed + determinism/WCET/N-validated — is the **production
+default**. AHO is the reference fallback. The HSD work is complete.
+
+---
+
 ## Final state summary
 
 ```
-Tests:      145 passing across 5 crates + 3 integration suites + 3 API + 8 FFI tests
+Tests:      150 passing across 5 crates + 3 integration suites + 3 API + 9 FFI tests
+              (145 → 150: Phase 33 HSD promotion + its adversarial-review hardening
+                              added +2 ipm (load-bearing hard-iter-cap +
+                              bit-determinism readiness gates), +2 solver-lib
+                              (scvx_converges_with_hsd_larger_n N=10 structured;
+                              solve_powered_descent_aho_reference_path — keeps the
+                              AHO reference path covered post-flip), +1 ffi
+                              (ffi_solve_with_hsd_runs_and_stays_finite,
+                              dense+structured HSD across the C-ABI))
               (144 → 145: Phase 32 deep re-audit added a regression test for the
                               CRITICAL adaptive-trust clamp-panic fix
                               (adaptive_trust_subfloor_rho_grow_no_panic))
@@ -1986,7 +2062,8 @@ Tests:      145 passing across 5 crates + 3 integration suites + 3 API + 8 FFI t
                                  + 1 wcet factor+apply-vs-one-shot benchmark)
 Crates:     5 (scvx-core, scvx-dynamics, scvx-ipm, scvx-solver, scvx-ffi)
 Example:    cargo run --release --example mars_descent — produces a
-              real Mars-descent trajectory, exit code 0
+              real Mars-descent trajectory, exit code 0 (now defaults to HSD:
+              cost 4.3702e3 ≈ AHO's 4.3699e3 — same trajectory, HSD direction)
 C-FFI:      cargo build --release -p scvx-ffi — produces .lib, .dll, .rlib
               with hand-written header at crates/scvx-ffi/include/scvx_ffi.h
 Clippy:     clean with --all-targets -- -D warnings

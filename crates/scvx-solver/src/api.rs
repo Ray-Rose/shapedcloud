@@ -4,7 +4,7 @@
 //! behind a single entrypoint, [`solve_powered_descent`]. Callers
 //! provide physical parameters, initial state, terminal target, and
 //! a few options; the solver builds a linear-interpolation reference,
-//! runs SCvx with sensible defaults (AHO + column preconditioning),
+//! runs SCvx with sensible defaults (HSD + column preconditioning),
 //! and writes the converged trajectory back into the workspace.
 //!
 //! ## Const-generic dim helpers
@@ -111,6 +111,19 @@ pub struct PoweredDescentOptions {
     /// Use NT-direction IPM. Default `false` (AHO is more robust on
     /// the SCvx subproblem; see HANDOFF.md "open todo").
     pub use_nt_scaling:      bool,
+    /// Use the **homogeneous self-dual (HSD)** embedded IPM direction — the
+    /// **production default** (Phase 33): it converges on the flight-scale
+    /// subproblem where plain NT diverges and AHO struggles, matching the external
+    /// oracle to ~1e-7 (see HANDOFF "Phase 26"). Takes precedence over
+    /// `use_nt_scaling`. Default `true`; set `false` to select the AHO reference
+    /// direction (the conservative, fully-reachable fallback).
+    pub use_hsd:             bool,
+    /// Use the O(N·NZ³) block-tridiagonal **structured** inner solve. Combined
+    /// with `use_hsd` it selects the structured HSD (`solve_socp_structured_hsd`
+    /// / `_free_tf`) — ~7× faster than dense at N=7 with zero fallbacks (Phases
+    /// 28–30). With AHO/NT the structured path has fallback erosion, so dense is
+    /// safer there. Default `false`.
+    pub use_structured_solve: bool,
 
     // ---- Termination ----
     /// SCvx outer-loop iteration cap.
@@ -144,6 +157,15 @@ impl Default for PoweredDescentOptions {
             use_preconditioning:  true,
             use_cone_row_scaling: false,
             use_nt_scaling:       false,
+            // HSD is the production default (Phase 33 promotion): it converges on
+            // the flight-scale subproblem where AHO struggles/fails, matching the
+            // external oracle ~4 orders tighter and in ~1/4 the inner iters, and
+            // it is determinism- + WCET- + N-sweep-validated and fully audited
+            // (HANDOFF Phases 26–33). Dense HSD here (the more-audited path);
+            // set `use_structured_solve = true` to opt into the O(N) structured
+            // HSD (~7× faster at N=7). Set `use_hsd = false` for the AHO reference.
+            use_hsd:              true,
+            use_structured_solve: false,
             max_outer_iters:       15,
             // Inner IPM cap of 25 matches the existing demos and
             // empirically gives the cleanest convergence. Higher caps
@@ -293,6 +315,7 @@ pub fn solve_powered_descent<
         conv_tol_x:      options.conv_tol_x,
         conv_tol_virt:   options.conv_tol_virt,
         use_free_tf:     options.use_free_tf,
+        use_structured_solve: options.use_structured_solve,
         ..ScvxAlgoParams::default()
     };
     let ipm = IpmAlgoParams {
@@ -304,6 +327,7 @@ pub fn solve_powered_descent<
         use_preconditioning:  options.use_preconditioning,
         use_cone_row_scaling: options.use_cone_row_scaling,
         use_nt_scaling:       options.use_nt_scaling,
+        use_hsd:              options.use_hsd,
         ..IpmAlgoParams::default()
     };
 
@@ -490,6 +514,61 @@ mod tests {
             // τ unchanged from initial.
             assert!((ws.reference.tau - 10.0).abs() < 1e-12,
                     "τ should be preserved in fixed-tf, got {}", ws.reference.tau);
+        });
+    }
+
+    /// **AHO reference path stays covered end-to-end.** After the Phase-33 flip,
+    /// `PoweredDescentOptions::default()` selects HSD, so every *other* high-level
+    /// test now exercises HSD. AHO is documented as the robust reference, "fully
+    /// reachable via `use_hsd = false`" — this test keeps that promise honest by
+    /// driving the AHO direction through the SAME public `solve_powered_descent`
+    /// entry point and requiring a clean end-to-end solve. (Without it, the flip
+    /// would leave the advertised reference path with no high-level coverage.)
+    #[test]
+    fn solve_powered_descent_aho_reference_path() {
+        run_in_big_stack(|| {
+            const N:         usize = 3;
+            const FREE_TF:   bool  = true;
+            const NP:        usize = workspace_np(N, FREE_TF);
+            const NE:        usize = workspace_ne(N);
+            const NCT:       usize = workspace_nct(N, FREE_TF);
+            const NCONES:    usize = workspace_ncones(N, FREE_TF);
+            const MAX_OUTER: usize = 15;
+
+            let phys = mars_params();
+            let mut initial_state = SVector::<f64, 7>::zeros();
+            initial_state[2] = 2.0;
+            initial_state[5] = -0.1;
+            initial_state[6] = (400.0_f64).ln();
+
+            let terminal = TerminalCondition { r: [0.0; 3], v: [0.0; 3] };
+            // Explicitly select the AHO reference direction (NOT the new default).
+            let options = PoweredDescentOptions {
+                initial_tau:         10.0,
+                target_mass:        380.0,
+                trust_eta0:           5.0,
+                trust_eta_max:       20.0,
+                use_hsd:             false,
+                ..PoweredDescentOptions::default()
+            };
+            assert!(!options.use_hsd, "this test must drive the AHO reference path");
+
+            let mut ws = Box::<ScvxWorkspace<N, NP, NE, NCT, NCONES, MAX_OUTER>>::default();
+            let status = solve_powered_descent(
+                &mut ws, &phys, &initial_state, &terminal, &options,
+            );
+            assert!(
+                matches!(status, SolverStatus::Converged | SolverStatus::OuterIterCap),
+                "AHO reference path returned unexpected status: {}", status as u32
+            );
+            for k in 0..N {
+                for i in 0..7 {
+                    assert!(ws.reference.x[(i, k)].is_finite(),
+                            "AHO path produced non-finite state at ({i},{k})");
+                }
+            }
+            assert!(ws.reference.tau >= phys.tau_lo && ws.reference.tau <= phys.tau_hi,
+                    "τ out of bounds on AHO path: {}", ws.reference.tau);
         });
     }
 }

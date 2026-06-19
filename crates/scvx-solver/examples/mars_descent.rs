@@ -120,6 +120,9 @@ fn run_demo() {
              options.initial_tau, phys.tau_lo, phys.tau_hi);
     println!("  use_free_tf     = {}", options.use_free_tf);
     println!("  preconditioning = {}", options.use_preconditioning);
+    println!("  direction       = {}",
+             if options.use_hsd { "HSD (homogeneous self-dual) [default]" }
+             else if options.use_nt_scaling { "NT" } else { "AHO" });
     println!("  max_outer_iters = {}", options.max_outer_iters);
     println!();
 

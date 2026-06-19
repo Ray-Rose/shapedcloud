@@ -53,16 +53,18 @@ library and a `no_std` bare-metal static library.
 
 ## Solver notes (honest)
 
-- **AHO is the production direction** — it converges to machine-precision dynamics
-  feasibility across Mars / active-drag / lunar regimes with column
-  preconditioning + a trust-region retry.
+- **AHO is the robust reference/fallback direction** (reachable via
+  `use_hsd = false`) — it converges to machine-precision dynamics feasibility
+  across Mars / active-drag / lunar regimes with column preconditioning + a
+  trust-region retry, and is the deterministic AHO baseline (demo cost `4.3699e3`).
+  HSD (below) is now the promoted production default.
 - The **Nesterov-Todd (NT)** direction is opt-in with graceful AHO fallback. It is
   *correct* on well-conditioned problems (verified against CVXPY/Clarabel and
   Julia/Clarabel oracles) but **diverges on flight-scale subproblems** where the
   relaxation cones vanish at the optimum — a documented limit of symmetric NT
   scaling, not a bug. `HANDOFF.md` records the full investigation.
-- A **homogeneous self-dual (HSD) embedded** direction (`solve_socp_hsd`, opt-in
-  via `use_hsd`) **cracks that NT limit and is the recommended direction** — the
+- A **homogeneous self-dual (HSD) embedded** direction (`solve_socp_hsd`, the
+  **production default** — toggle with `use_hsd`) **cracks that NT limit** — the
   production-solver approach (ECOS/Clarabel). On the *same* flight-scale subproblem
   where plain NT diverges (duality gap → 1e13), HSD converges to the external
   CVXPY/Clarabel + Julia optimum to **~1e-7 relative cost in 15 iterations** —
@@ -71,9 +73,13 @@ library and a `no_std` bare-metal static library.
   envelope (Mars fixed/free-tf, drag, lunar); the **O(N) structured HSD**
   (`use_structured_solve`) is **~7× faster than dense at N=7 and growing, with
   zero fallbacks** — the linear-time win the structured AHO/NT paths never
-  realized. AHO stays the current *default* pending HSD's flight-hardening
-  checklist (FFI exposure, determinism/WCET re-baseline). See `HANDOFF.md`
-  Phases 26–31.
+  realized. **HSD is now the PRODUCTION DEFAULT** (Phase 33): the flight-hardening
+  checklist is complete — exposed in the C-ABI (`COptions::use_hsd`),
+  bit-deterministic, WCET-bounded (the same compile-time inner-iter cap), and
+  N-sweep-validated, after a from-scratch project-wide re-audit (which also fixed a
+  latent adaptive-trust panic). AHO stays the fully-reachable reference
+  (`use_hsd = false`). The demo defaults to HSD (cost `4.3702e3`, ≈ AHO's
+  `4.3699e3` — same trajectory). See `HANDOFF.md` Phases 26–33.
 - A **block-tridiagonal Schur** primitive provides the O(N) inner solve
   (per-step machine-precision-equivalent to dense; realized end-to-end by HSD).
 
