@@ -166,8 +166,9 @@ pub struct COptions {
     pub use_preconditioning:  u8,
     /// 0 = disabled, non-zero = enabled.
     pub use_cone_row_scaling: u8,
-    /// 0 = AHO, non-zero = NT. **AHO recommended** (NT is not yet
-    /// convergent on all configurations; see HANDOFF.md).
+    /// 0 = AHO, non-zero = NT. **Ignored when `use_hsd` is set** (HSD takes
+    /// precedence); with HSD off, AHO (=0) is safer than NT, which is not yet
+    /// convergent on all configurations (see HANDOFF.md).
     pub use_nt_scaling:       u8,
     /// 0 = disabled, non-zero = **HSD** (homogeneous self-dual) direction — the
     /// recommended direction; takes precedence over `use_nt_scaling`. Converges
@@ -1053,14 +1054,15 @@ mod tests {
                 }
                 assert!(traj8.tau.is_finite() && traj8.tau > 0.0);
             }
-            // NOTE: HSD spans the full FFI N range (3..20), but at large N the
-            // dense NCT×NCT scaling matrices the inner solve builds on the stack
+            // NOTE: HSD is dimension-generic across the full FFI N range (3..=20),
+            // but the committed end-to-end coverage stops at N≤10 (here N=8, plus
+            // the `scvx_converges_with_hsd_larger_n` N=10 gate): at large N the dense
+            // NCT×NCT scaling matrices the inner solve builds on the stack
             // (NCT = 30·N → ~2.9 MB each at N=20) require a correspondingly large
-            // thread stack — a general property of ALL directions (AHO/NT/HSD),
-            // not HSD-specific. The committed N≤10 coverage here + the
-            // `scvx_converges_with_hsd_larger_n` (N=10) gate + the O(N) time
-            // benchmark establish the scaling; the production integrator sizes the
-            // static arena / stack for the chosen max N (see INTEGRATION.md).
+            // thread stack — a general property of ALL directions (AHO/NT/HSD), not
+            // HSD-specific. Those tests + the O(N) time benchmark establish the
+            // scaling; the production integrator sizes the static arena / stack for
+            // the chosen max N (see INTEGRATION.md).
         });
     }
 }

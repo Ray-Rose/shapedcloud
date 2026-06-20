@@ -2217,16 +2217,20 @@ mod tests {
 
     /// **WCET (promotion readiness) — the HSD inner loop honors its iteration
     /// bound.** `solve_socp_hsd`'s loop is `0..max_iters.min(IPM_HARD_MAX_ITERS)`
-    /// — the SAME compile-time clamp AHO/NT use — so a Rust/FFI caller cannot blow
-    /// the flight time budget by requesting a huge `max_iters`.
+    /// (socp.rs) — the SAME compile-time clamp AHO/NT use — so a Rust/FFI caller
+    /// cannot blow the flight time budget by requesting a huge `max_iters`.
     ///
-    /// HSD converges on well-posed toys in well under the 64 cap, so a bare
-    /// `max_iters = 200 ⇒ iters ≤ 64` check would be VACUOUS (it holds even if the
-    /// clamp were deleted, because this problem never wants 64 iters). We instead
-    /// make the bound LOAD-BEARING: cap `max_iters` *below* the natural convergence
-    /// count and require the loop to stop there. This is the ONLY guard on the HSD
-    /// loop bound — HSD has its own loop, distinct from AHO's (which is covered by
-    /// `scvx::tests::ipm_iters_respect_hard_cap` via engineered non-convergence).
+    /// This toy reaches its natural best-feasible exit at **iter 3** (the `iter > 2`
+    /// screen first fires there). So checks like `max_iters = 200 ⇒ iters ≤ 64`, or
+    /// even `max_iters = 3 ⇒ iters ≤ 3`, are VACUOUS — they hold even with the loop
+    /// bound deleted, because the problem converges at iter 3 regardless. We make
+    /// the bound genuinely LOAD-BEARING by capping `max_iters = 2`, *strictly below*
+    /// the iter-3 exit: with the `0..max_iters` bound intact the solve reports
+    /// `iters = 2`; if that bound were removed it would run on to the iter-3 exit
+    /// and report 3, so `iters ≤ 2` fails *exactly* when the loop bound is dropped.
+    /// This is the ONLY guard on the HSD loop bound — HSD has its own loop, distinct
+    /// from AHO's (which is covered by `scvx::tests::ipm_iters_respect_hard_cap` via
+    /// engineered non-convergence).
     #[test]
     fn hsd_respects_hard_iter_cap() {
         const NP: usize = 3;
@@ -2242,27 +2246,31 @@ mod tests {
             cones: [ConeDesc { offset: 0, dim: 3 }],
         };
 
-        // (1) LOAD-BEARING: max_iters = 3 is below this toy's natural convergence
-        // — the loose best-feasible screen cannot fire before `iter > 2`, and
-        // strict μ-convergence needs more — so the loop MUST stop at the bound.
-        // If the `.min(..)` loop bound were removed, the solve would run on to
-        // natural convergence and report > 3, failing this assertion.
+        // (1) LOAD-BEARING: max_iters = 2 is strictly below this toy's natural
+        // best-feasible exit at iter 3 (the `iter > 2` screen can't fire before
+        // then, and strict μ-convergence needs more), so the `0..max_iters` bound
+        // MUST stop the loop at iters = 2. If that bound were dropped the solve
+        // would run on to the iter-3 exit and report 3 — so this assertion fails
+        // exactly when the loop bound is removed. (Empirically: cap intact → 2,
+        // cap-less → 3.)
         let mut ws_capped = SocpWorkspace::<NP, NE, NCT>::default();
         let capped = solve_socp_hsd(
             &prob,
-            &IpmAlgoParams { max_iters: 3, ..IpmAlgoParams::default() },
+            &IpmAlgoParams { max_iters: 2, ..IpmAlgoParams::default() },
             &mut ws_capped,
         );
         assert!(
-            capped.iters <= 3,
-            "HSD ignored max_iters=3 and ran {} iters — loop bound not enforced",
+            capped.iters <= 2,
+            "HSD ignored max_iters=2 and ran {} iters — loop bound not enforced",
             capped.iters
         );
 
-        // (2) STRUCTURAL CEILING: the same `max_iters.min(IPM_HARD_MAX_ITERS)` bound
-        // clamps an absurd caller request to the compile-time cap, so a
-        // `max_iters = 200` caller can never exceed the 64-iter WCET budget —
-        // identical to the AHO/NT guarantee.
+        // (2) STRUCTURAL CEILING (documentation, not load-bearing for this toy):
+        // the same `max_iters.min(IPM_HARD_MAX_ITERS)` bound clamps an absurd caller
+        // request to the compile-time cap, so a `max_iters = 200` caller can never
+        // exceed the 64-iter WCET budget. This toy converges at iter 3 ≪ 64, so the
+        // 64 clamp is a *structural* guarantee here (visible in the loop header),
+        // not the binding constraint — part (1) is the real guard.
         let mut ws_huge = SocpWorkspace::<NP, NE, NCT>::default();
         let huge = solve_socp_hsd(
             &prob,

@@ -1947,13 +1947,16 @@ The Phase-31 staged-promotion checklist is complete; HSD is now the default.
 2. **Determinism** — `hsd_solve_is_bit_deterministic`: two solves are BIT-identical
    (`to_bits()` on x/s/y). HSD uses only f64 IEEE-754 + `libm` (no RNG/threading) —
    the same cross-platform bit-match mechanism as AHO.
-3. **WCET + N-sweep** — `hsd_respects_hard_iter_cap`: HSD honors the compile-time
-   `IPM_HARD_MAX_ITERS = 64` (a `max_iters = 200` caller cannot blow the budget).
-   `scvx_converges_with_hsd_larger_n` (N=10): the O(N) structured HSD converges to
-   ‖ν‖ 7.7e-9 with ZERO fallbacks; the FFI smoke covers N=8 dense+structured. (At
-   large N the dense `NCT×NCT` scaling matrices need a correspondingly larger
-   stack — a property of ALL directions, not HSD-specific; the integrator sizes
-   the static arena for the chosen max N.)
+3. **WCET + N-sweep** — `hsd_respects_hard_iter_cap`: HSD's loop is bounded by the
+   same `max_iters.min(IPM_HARD_MAX_ITERS = 64)` clamp AHO/NT use; the test makes it
+   *load-bearing* by capping `max_iters = 2`, strictly below the toy's iter-3 natural
+   exit, so it fails iff the bound is dropped (see the review note above for why the
+   first `= 3` attempt was still vacuous). `scvx_converges_with_hsd_larger_n` (N=10):
+   the O(N) structured HSD converges to ‖ν‖ 7.7e-9 with ZERO fallbacks; the FFI smoke
+   covers N=8 dense+structured. (The end-to-end sweep stops at **N=10**, not the
+   checklist's literal N=20: at large N the dense `NCT×NCT` scaling matrices need a
+   correspondingly larger stack — a property of ALL directions, not HSD-specific; the
+   integrator sizes the static arena for the chosen max N.)
 4. **The flip** — `PoweredDescentOptions::default().use_hsd = true`. This makes the
    high-level API, the FFI `scvx_options_default`, and the `mars_descent` example
    default to (dense) HSD. `use_structured_solve` stays opt-in (dense is the
@@ -1976,11 +1979,14 @@ default-flip blast radius, new-test quality, doc-truth) returned **SHIP-WITH-NIT
   its namesake (no swap), and `scvx_options_default` matches the flipped Rust
   default. No memory-safety / wrong-behavior bug at the C boundary.
 - **Two findings fixed before commit**:
-  - *Vacuous WCET assert* — `hsd_respects_hard_iter_cap` asserted `iters ≤ 64` on a
-    toy converging in ~10 iters, so it held even if the loop bound were deleted. Now
-    LOAD-BEARING: caps `max_iters = 3` below natural convergence and requires the
-    loop to stop there (the only guard on HSD's own loop, distinct from AHO's
-    `ipm_iters_respect_hard_cap`).
+  - *Vacuous WCET assert* — `hsd_respects_hard_iter_cap` originally asserted
+    `iters ≤ 64` on a toy that converges at iter 3, so it held even with the loop
+    bound deleted. The first fix (cap `max_iters = 3`) was STILL vacuous — iter 3 is
+    exactly the natural exit — which a second, *empirical* pre-push audit caught (it
+    ran the toy and observed cap-less → iters 3). Final fix is genuinely
+    LOAD-BEARING: cap `max_iters = 2`, strictly below the iter-3 exit (cap intact →
+    iters 2; cap-less → 3), so `iters ≤ 2` fails exactly when the bound is dropped —
+    the only guard on HSD's own loop, distinct from AHO's `ipm_iters_respect_hard_cap`.
   - *Lost AHO coverage* — post-flip, no end-to-end test drove the AHO reference path
     through the high-level API. Added `solve_powered_descent_aho_reference_path`
     (`use_hsd = false`), keeping the advertised reference path honest.
